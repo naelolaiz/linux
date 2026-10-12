@@ -17,7 +17,9 @@
 #include <net/gro.h>
 #include "esp32s31-rx-copy.h"
 
-static const unsigned int sm_io_cpu = 1;
+static unsigned int sm_io_cpu = 1;
+module_param_named(io_cpu, sm_io_cpu, uint, 0444);
+MODULE_PARM_DESC(io_cpu, "CPU for NAPI and TX work; 0 if that CPU is offline");
 /* skb_copy_bits() in the SRAM bridge consumes page frags without retaining
  * them. Let TCP keep those frags until that single mandatory staging copy. */
 static const bool sm_tx_sg = true;
@@ -231,7 +233,7 @@ static void sm_rx_kick(void *arg)
 
 static void sm_schedule_rx_locked(struct s31_sm *sm)
 {
- unsigned int cpu = cpu_online(1) ? 1 : 0;
+ unsigned int cpu = sm_io_target();
  int ret;
 
  if (test_bit(NAPI_STATE_SCHED, &sm->napi.state)) return;
@@ -1150,6 +1152,10 @@ static void sm_stop(struct ieee80211_hw *hw, bool suspend)
 	/* No producer can submit after running=false. Completion occurs under
          * sm->lock; acquire it once more before disabling/freeing NAPI. */
 	wait_for_completion(&sm->rx_kick_done);
+	/* Re-arm it for the next stop: a kick on the target CPU itself calls
+	 * napi_schedule() directly and never completes it again.
+	 */
+	complete(&sm->rx_kick_done);
 	spin_lock_irqsave(&sm->lock, flags);
 	spin_unlock_irqrestore(&sm->lock, flags);
 	cancel_delayed_work_sync(&sm->timer);
