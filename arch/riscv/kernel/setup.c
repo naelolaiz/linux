@@ -115,7 +115,16 @@ static int __init add_kernel_resources(void)
 	bss_res.end = __pa_symbol(__bss_stop) - 1;
 	bss_res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 
-	kimage_res.start = code_res.start;
+	/*
+	 * An XIP kernel's code and rodata stay in flash, below or above RAM:
+	 * an image resource from there to the end of bss would straddle the
+	 * start or the end of System RAM, and inserting the RAM would fail.
+	 * Only the data and bss copied into RAM are the image there.
+	 */
+	if (IS_ENABLED(CONFIG_XIP_KERNEL))
+		kimage_res.start = data_res.start;
+	else
+		kimage_res.start = code_res.start;
 	kimage_res.end = bss_res.end;
 	kimage_res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 
@@ -123,13 +132,15 @@ static int __init add_kernel_resources(void)
 	if (ret < 0)
 		return ret;
 
-	ret = add_resource(&kimage_res, &code_res);
-	if (ret < 0)
-		return ret;
+	if (!IS_ENABLED(CONFIG_XIP_KERNEL)) {
+		ret = add_resource(&kimage_res, &code_res);
+		if (ret < 0)
+			return ret;
 
-	ret = add_resource(&kimage_res, &rodata_res);
-	if (ret < 0)
-		return ret;
+		ret = add_resource(&kimage_res, &rodata_res);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = add_resource(&kimage_res, &data_res);
 	if (ret < 0)
