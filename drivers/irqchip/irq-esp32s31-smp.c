@@ -25,6 +25,7 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqchip/irq-esp32s31.h>
 #include <linux/moduleparam.h>
+#include <linux/reboot.h>
 #include <linux/smp.h>
 
 #include <asm/esp-clic.h>
@@ -266,3 +267,43 @@ err_boot_hart_only:
 	esp32s31_boot_hart_only();
 	return ret;
 }
+
+/*
+ * Espressif's OpenSBI resets only hart 0 for a reboot or a power-off, and
+ * hart 1 would keep running this kernel. Take it down through the SBI HSM
+ * stop first, which holds it in reset. From kernel_restart(), kernel_halt()
+ * and kernel_power_off(), in process context, before device_shutdown().
+ */
+static int esp32s31_smp_reboot(struct notifier_block *nb,
+			       unsigned long action, void *data)
+{
+	smp_shutdown_nonboot_cpus(0);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block esp32s31_smp_reboot_nb = {
+	.notifier_call = esp32s31_smp_reboot,
+};
+
+/*
+ * Keep hart 0 online: every device interrupt is routed to it and cannot
+ * move (esp_intmtx_set_affinity()), the radio runs on it, and Espressif's
+ * OpenSBI starts only hart 1, so a stopped hart 0 would not come back.
+ * Writes to /sys/devices/system/cpu/cpu0/online then fail with EPERM.
+ * The CPU devices are registered before the initcalls run.
+ */
+static int __init esp32s31_smp_late_init(void)
+{
+	struct device *dev;
+
+	if (!esp32s31_doorbells)
+		return 0;
+
+	dev = get_cpu_device(0);
+	if (dev)
+		dev->offline_disabled = true;
+
+	register_reboot_notifier(&esp32s31_smp_reboot_nb);
+	return 0;
+}
+device_initcall(esp32s31_smp_late_init);
