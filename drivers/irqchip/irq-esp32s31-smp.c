@@ -1,327 +1,208 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * ESP32-S31 SMP-local interrupts.
+ * ESP32-S31 per-hart interrupts: the cross-core IPI and the timer.
  *
- * Keep these fixed per-hart routes out of the generic CLIC and INTMTX
- * domains: normal device IRQs remain dynamically allocated and pinned to
- * hart 0, while each hart owns one doorbell slot and one direct SYSTIMER
- * slot.  Timer and IPI never share a CLIC entry.
+ * Device interrupts stay in the CLIC and INTMTX domains, routed to hart 0.
+ * Each hart also takes two interrupts in its own S-mode CLIC bank, routed
+ * in its own INTMTX table:
+ *
+ * - CLIC 40: the doorbell to this hart (HP_SYSTEM CPU_INT_FROM_CPU_n,
+ *   matrix source 65 + n). Linux's IPIs are multiplexed on it.
+ * - CLIC 41: systimer comparator n (matrix source 33 + n), for the per-CPU
+ *   clockevent of timer-esp32s31-systimer.c.
+ *
+ * Linux IPIs then never go through the SBI, and neither do remote TLB and
+ * I-cache flushes: riscv_ipi_set_virq_range() runs here, before
+ * sbi_ipi_init(), which then neither installs SBI IPIs nor turns on SBI
+ * remote fences. Espressif's OpenSBI has no IPI device for either.
  */
 
-#include <linux/types.h>
 #include <linux/cpu.h>
-#include <linux/init.h>
-#include <linux/clocksource/esp32s31-systimer.h>
 #include <linux/cpuhotplug.h>
-#include <linux/export.h>
+#include <linux/init.h>
 #include <linux/io.h>
 #include <linux/irq.h>
-#include <linux/irqflags.h>
-#include <linux/hardirq.h>
 #include <linux/irqchip/chained_irq.h>
-#include <linux/percpu.h>
-#include <linux/soc/espressif/esp32s31-pm.h>
+#include <linux/irqchip/irq-esp32s31.h>
 #include <linux/smp.h>
-#include <linux/string.h>
 
-#include <asm/irq_regs.h>
-#include <asm/ptrace.h>
-#include <asm/sbi.h>
 #include <asm/smp.h>
 
 #include "irq-esp32s31-internal.h"
 
-#define ESP32S31_IPI_DOORBELL_BASE	0x20586010U
-#define ESP32S31_IPI_DOORBELL_SIZE	0x8U
-#define ESP32S31_IPI_TO_CPU0_OFF		0x0U
-#define ESP32S31_IPI_TO_CPU1_OFF		0x4U
+/* HP_SYSTEM CPU_INT_FROM_CPU_0 (rings hart 0) and _1 (rings hart 1). */
+#define ESP32S31_DOORBELL_BASE		0x20586010U
+#define ESP32S31_DOORBELL_SIZE		0x8U
 
-#define ESP32S31_IPI_TO_CPU0_SOURCE	65U
-#define ESP32S31_IPI_TO_CPU1_SOURCE	66U
-#define ESP32S31_SYSTIMER_CPU0_SOURCE	33U
-#define ESP32S31_SYSTIMER_CPU1_SOURCE	34U
+#define ESP32S31_IPI_SOURCE(cpu)	(65U + (cpu))
+#define ESP32S31_TIMER_SOURCE(cpu)	(33U + (cpu))
 
-#define ESP32S31_SBI_EXT_CLIC		0x09000003UL
-#define ESP32S31_SBI_CLIC_MINTSTATUS	0
-#define ESP32S31_SBI_CLIC_MINTTHRESH	1
-#define ESP32S31_SBI_CLIC_MIP		2
-#define ESP32S31_SBI_CLIC_MIE		3
-#define ESP32S31_SBI_CLIC_WFI		4
+#define ESP32S31_NR_HARTS		2U
 
 static void __iomem *esp32s31_doorbells;
-/* Keep real WFI command-line gated so older OpenSBI images fail safe. */
-static bool esp32s31_idle_requested;
-static bool esp32s31_idle_proxy_ready;
 
-static int __init esp32s31_idle_setup(char *str)
+static void __iomem *esp32s31_doorbell(unsigned int cpu)
 {
-	esp32s31_idle_requested = !strcmp(str, "wfi");
-	return 0;
-}
-early_param("esp32s31_idle", esp32s31_idle_setup);
-
-bool noinstr esp32s31_sbi_idle_enabled(void)
-{
-	return esp32s31_idle_proxy_ready;
-}
-
-int esp32s31_sbi_idle_activate(void)
-{
-	long probe;
-
-	if (!esp32s31_idle_requested)
-		return -ENODEV;
-	/* OpenSBI owns one timer-group guard comparator per hart, so it can enter
-	 * WFI without using the shared CLINT alias or relying on delegated
-	 * interrupts to cross an M-mode WFI boundary.
-	 */
-	probe = sbi_probe_extension(ESP32S31_SBI_EXT_CLIC);
-	if (probe <= 0)
-		return -ENODEV;
-
-	/* Runtime timers are initialized before the cpuidle device initcall. */
-	esp32s31_idle_proxy_ready = true;
-	cpu_idle_poll_ctrl(false);
-	pr_info("esp32s31-smp: concurrent per-hart WFI enabled (M-mode guard)\n");
-	return 0;
-}
-
-void esp32s31_sbi_idle_deactivate(void)
-{
-	esp32s31_idle_proxy_ready = false;
-	cpu_idle_poll_ctrl(true);
-}
-
-static unsigned long esp32s31_clic_sbi_read(unsigned long funcid)
-{
-	struct sbiret ret;
-
-	ret = sbi_ecall(ESP32S31_SBI_EXT_CLIC, funcid,
-			0, 0, 0, 0, 0, 0);
-	return ret.error ? ~0UL : ret.value;
-}
-
-static void esp32s31_clic_log_state(unsigned int cpu)
-{
-	pr_info("esp32s31-smp: hart%u CLIC mintstatus=%#lx mintthresh=%#lx mip=%#lx mie=%#lx\n",
-		cpu,
-		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MINTSTATUS),
-		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MINTTHRESH),
-		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MIP),
-		esp32s31_clic_sbi_read(ESP32S31_SBI_CLIC_MIE));
-}
-
-void noinstr esp32s31_sbi_wfi(void)
-{
-	register unsigned long a0 asm("a0") = 0;
-	register unsigned long a1 asm("a1") = 0;
-	register unsigned long a2 asm("a2") = 0;
-	register unsigned long a3 asm("a3") = 0;
-	register unsigned long a4 asm("a4") = 0;
-	register unsigned long a5 asm("a5") = 0;
-	register unsigned long a6 asm("a6") = ESP32S31_SBI_CLIC_WFI;
-	register unsigned long a7 asm("a7") = ESP32S31_SBI_EXT_CLIC;
-
-	/* Keep the idle core's IRQ-disabled entry atomic with respect to wake
-	 * events. Enabling IRQs here can consume an IPI/timer before the SBI
-	 * boundary masks SIE again, then enter WFI after that wake was handled.
-	 * The private M-level guard wakes with SIE clear; cpuidle enables IRQs
-	 * after return. Preserve the existing SBI trap-state recovery sequence.
-	 */
-	raw_local_irq_disable();
-	asm volatile(RISCV_SBI_ECALL_ASM
-		     : "+r"(a0), "+r"(a1)
-		     : "r"(a2), "r"(a3), "r"(a4), "r"(a5),
-		       "r"(a6), "r"(a7)
-		     : RISCV_SBI_ECALL_CLOBBERS);
-	raw_local_irq_disable();
-}
-
-static unsigned int esp32s31_doorbell_offset(unsigned int cpu)
-{
-	return cpu ? ESP32S31_IPI_TO_CPU1_OFF : ESP32S31_IPI_TO_CPU0_OFF;
-}
-
-static unsigned int esp32s31_ipi_source(unsigned int cpu)
-{
-	return cpu ? ESP32S31_IPI_TO_CPU1_SOURCE :
-		     ESP32S31_IPI_TO_CPU0_SOURCE;
-}
-
-static unsigned int esp32s31_timer_source(unsigned int cpu)
-{
-	return cpu ? ESP32S31_SYSTIMER_CPU1_SOURCE :
-		     ESP32S31_SYSTIMER_CPU0_SOURCE;
+	return esp32s31_doorbells + cpu * 4;
 }
 
 static void esp32s31_ipi_send(unsigned int cpu)
 {
-	if (WARN_ON_ONCE(!esp32s31_doorbells || cpu >= nr_cpu_ids))
+	if (WARN_ON_ONCE(cpu >= ESP32S31_NR_HARTS))
 		return;
 
-	/* Publish the ipi_mux reason before asserting the level doorbell. */
-	wmb();
-	writel(1, esp32s31_doorbells + esp32s31_doorbell_offset(cpu));
-}
-
-static void esp32s31_ipi_chained(struct irq_desc *desc)
-{
-	struct irq_chip *chip = irq_desc_get_chip(desc);
-	unsigned int cpu = raw_smp_processor_id();
-	unsigned int off = esp32s31_doorbell_offset(cpu);
-
-	chained_irq_enter(chip, desc);
-	if (readl(esp32s31_doorbells + off)) {
-		do {
-			writel(0, esp32s31_doorbells + off);
-			ipi_mux_process();
-			/* Pair the doorbell clear with a sender that races while its
-			 * mux bit is already set and therefore does not ring again. */
-			smp_mb();
-		} while (readl(esp32s31_doorbells + off) || ipi_mux_pending());
-	}
-	chained_irq_exit(chip, desc);
-}
-
-static void esp32s31_timer_chained(struct irq_desc *desc)
-{
-	struct irq_chip *chip = irq_desc_get_chip(desc);
-	unsigned int cpu = raw_smp_processor_id();
-
-	chained_irq_enter(chip, desc);
-	if (esp32s31_systimer_irq_pending(cpu))
-		esp32s31_riscv_timer_interrupt();
-	chained_irq_exit(chip, desc);
+	/* writel() orders the reason bit ipi_mux set before the doorbell. */
+	writel(1, esp32s31_doorbell(cpu));
 }
 
 /*
- * Preserve the official CLIC/INTMTX interrupt domains and handlers, but give
- * SMP an escape hatch for S31's cross-privilege 0xff sentinel.  Both harts use
- * the generic IRQ-enabled idle polling loop; when hardware has left a source
- * pending but refuses CLIC entry, drain that same source through its normal
- * Linux handler without manufacturing an xret boundary.
+ * The doorbell is a level that software sets and clears. Clear it before
+ * processing, then look again: a sender that found its reason bit already
+ * set did not ring, so a reason can be pending with the doorbell clear.
  */
-void esp32s31_irq_poll(void)
+static void esp32s31_ipi_chained(struct irq_desc *desc)
 {
-	struct pt_regs regs = { };
-	struct pt_regs *old_regs;
-	unsigned long flags;
-	unsigned int cpu = raw_smp_processor_id();
-	unsigned int off;
-	u32 device_pending;
-	bool ipi_pending, timer_pending;
+	struct irq_chip *chip = irq_desc_get_chip(desc);
+	void __iomem *db = esp32s31_doorbell(raw_smp_processor_id());
 
-	if (unlikely(!esp32s31_doorbells || cpu > 1))
-		return;
-
-	off = esp32s31_doorbell_offset(cpu);
-	local_irq_save(flags);
-	ipi_pending = readl(esp32s31_doorbells + off);
-	timer_pending = esp32s31_systimer_irq_pending(cpu);
-	device_pending = esp_clic_pending_mask(cpu);
-	if (!ipi_pending && !timer_pending && !device_pending) {
-		local_irq_restore(flags);
-		return;
-	}
-
-	regs.status = SR_SPP;
-	old_regs = set_irq_regs(&regs);
-	irq_enter();
-	if (ipi_pending) {
+	chained_irq_enter(chip, desc);
+	if (readl(db)) {
 		do {
-			writel(0, esp32s31_doorbells + off);
+			writel(0, db);
 			ipi_mux_process();
+			/* Order the processing before the re-check of the bits. */
 			smp_mb();
-		} while (readl(esp32s31_doorbells + off) || ipi_mux_pending());
+		} while (readl(db) || ipi_mux_pending());
 	}
-	if (timer_pending)
-		esp32s31_riscv_timer_interrupt();
-	if (device_pending)
-		esp_clic_handle_pending(device_pending);
-	irq_exit();
-	set_irq_regs(old_regs);
-	local_irq_restore(flags);
+	chained_irq_exit(chip, desc);
 }
-EXPORT_SYMBOL_GPL(esp32s31_irq_poll);
 
-static int esp32s31_local_irq_starting(unsigned int cpu)
+static int esp32s31_ipi_starting_cpu(unsigned int cpu)
 {
-	if (cpu > 1)
+	if (cpu >= ESP32S31_NR_HARTS)
 		return -EINVAL;
 
-	writel(0, esp32s31_doorbells + esp32s31_doorbell_offset(cpu));
-	esp_intmtx_route_local(cpu, esp32s31_ipi_source(cpu),
-				ESP32S31_CLIC_IPI_SLOT);
+	writel(0, esp32s31_doorbell(cpu));
+	esp_intmtx_route_local(cpu, ESP32S31_IPI_SOURCE(cpu),
+			       ESP32S31_CLIC_IPI_SLOT);
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_IPI_SLOT, true);
-	esp32s31_clic_log_state(cpu);
 	return 0;
 }
 
-static int esp32s31_local_irq_dying(unsigned int cpu)
+static int esp32s31_ipi_dying_cpu(unsigned int cpu)
 {
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_IPI_SLOT, false);
-	esp_intmtx_unroute_local(cpu, esp32s31_ipi_source(cpu));
-	writel(0, esp32s31_doorbells + esp32s31_doorbell_offset(cpu));
+	esp_intmtx_unroute_local(cpu, ESP32S31_IPI_SOURCE(cpu));
+	writel(0, esp32s31_doorbell(cpu));
 	return 0;
 }
 
-int esp32s31_systimer_irq_starting(unsigned int cpu)
+/*
+ * Without the doorbells no other hart can take an IPI or a per-hart timer
+ * interrupt: keep Linux on the boot hart. Runs before smp_prepare_cpus(),
+ * which marks the possible CPUs present, so no other CPU is brought up or
+ * offered for hotplug.
+ */
+static void __init esp32s31_boot_hart_only(void)
 {
-	if (cpu > 1)
-		return -EINVAL;
+	unsigned int cpu;
 
-	/*
-	 * riscv_timer_starting_cpu() cleared stale state before registering the
-	 * clockevent.  Do not stop it here: registration may already have armed
-	 * the first event needed to start the kernel tick.
-	 */
-	esp_intmtx_route_local(cpu, esp32s31_timer_source(cpu),
-				ESP32S31_CLIC_TIMER_SLOT);
-	esp_clic_configure_local(cpu, ESP32S31_CLIC_TIMER_SLOT, true);
-	return 0;
+	for_each_possible_cpu(cpu) {
+		if (cpu == smp_processor_id())
+			continue;
+		set_cpu_possible(cpu, false);
+		pr_warn("esp32s31-smp: no cross-core IPI, CPU%u stays down\n", cpu);
+	}
 }
 
-int esp32s31_systimer_irq_dying(unsigned int cpu)
+/**
+ * esp32s31_local_timer_init - take CLIC 41 for the per-hart comparators
+ *
+ * Return: the per-CPU Linux interrupt of CLIC 41, for request_percpu_irq(),
+ * or a negative error. -ENODEV: the cross-core IPI is not up and nothing
+ * was set up; Linux then stays on the boot hart.
+ */
+int __init esp32s31_local_timer_init(void)
+{
+	if (!esp32s31_doorbells) {
+		esp32s31_boot_hart_only();
+		return -ENODEV;
+	}
+
+	return esp_clic_map_local(ESP32S31_CLIC_TIMER_SLOT);
+}
+
+/* From a CPU hotplug STARTING callback on @cpu, interrupts off. */
+void esp32s31_local_timer_enable(unsigned int cpu)
+{
+	esp_intmtx_route_local(cpu, ESP32S31_TIMER_SOURCE(cpu),
+			       ESP32S31_CLIC_TIMER_SLOT);
+	esp_clic_configure_local(cpu, ESP32S31_CLIC_TIMER_SLOT, true);
+}
+
+void esp32s31_local_timer_disable(unsigned int cpu)
 {
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_TIMER_SLOT, false);
-	esp_intmtx_unroute_local(cpu, esp32s31_timer_source(cpu));
-	return 0;
+	esp_intmtx_unroute_local(cpu, ESP32S31_TIMER_SOURCE(cpu));
 }
 
+/* From the INTMTX init, once the CLIC and INTMTX drivers are up. */
 int __init esp32s31_smp_irq_init(void)
 {
 	int ret, virq;
 
-	esp32s31_doorbells = ioremap(ESP32S31_IPI_DOORBELL_BASE,
-				      ESP32S31_IPI_DOORBELL_SIZE);
-	if (!esp32s31_doorbells)
-		return -ENOMEM;
+	esp32s31_doorbells = ioremap(ESP32S31_DOORBELL_BASE,
+				     ESP32S31_DOORBELL_SIZE);
+	if (!esp32s31_doorbells) {
+		ret = -ENOMEM;
+		goto err_boot_hart_only;
+	}
+
 	ret = esp_clic_install_local(ESP32S31_CLIC_IPI_SLOT,
 				     esp32s31_ipi_chained, NULL);
 	if (ret)
-		return ret;
-	ret = esp_clic_install_local(ESP32S31_CLIC_TIMER_SLOT,
-				     esp32s31_timer_chained, NULL);
-	if (ret)
-		return ret;
+		goto err_unmap;
 
+	ret = cpuhp_setup_state_nocalls(CPUHP_AP_IRQ_ESP32S31_IPI_STARTING,
+					"irqchip/esp32s31-ipi:starting",
+					esp32s31_ipi_starting_cpu,
+					esp32s31_ipi_dying_cpu);
+	if (ret)
+		goto err_unmap;
+
+	ret = esp32s31_ipi_starting_cpu(smp_processor_id());
+	if (ret)
+		goto err_remove_state;
+
+	/*
+	 * A second ipi_mux_create() fails, so nothing that can fail comes
+	 * after it: on any failure sbi_ipi_init() still creates its own.
+	 */
 	virq = ipi_mux_create(BITS_PER_BYTE, esp32s31_ipi_send);
-	if (virq <= 0)
-		return virq < 0 ? virq : -ENOMEM;
+	if (virq <= 0) {
+		ret = virq < 0 ? virq : -ENOMEM;
+		goto err_stop_cpu;
+	}
+
+	/*
+	 * Last, as it cannot be undone. sbi_ipi_init() returns early once the
+	 * IPI range is set, and neither IPIs nor remote fences go through the
+	 * SBI.
+	 */
 	riscv_ipi_set_virq_range(virq, BITS_PER_BYTE);
 
-	ret = cpuhp_setup_state_nocalls(CPUHP_AP_IRQ_RISCV_SBI_IPI_STARTING,
-					 "irqchip/esp32s31:starting",
-					 esp32s31_local_irq_starting,
-					 esp32s31_local_irq_dying);
-	if (ret)
-		return ret;
-
-	ret = esp32s31_local_irq_starting(0);
-	if (ret)
-		return ret;
-
-	pr_info("esp32s31-smp: hart-local IPI slot %u, direct timer slot %u\n",
+	pr_info("esp32s31-smp: cross-core IPI on CLIC %u, per-hart timer on CLIC %u\n",
 		ESP32S31_CLIC_IPI_SLOT, ESP32S31_CLIC_TIMER_SLOT);
 	return 0;
+
+err_stop_cpu:
+	esp32s31_ipi_dying_cpu(smp_processor_id());
+err_remove_state:
+	cpuhp_remove_state_nocalls(CPUHP_AP_IRQ_ESP32S31_IPI_STARTING);
+err_unmap:
+	iounmap(esp32s31_doorbells);
+	esp32s31_doorbells = NULL;
+err_boot_hart_only:
+	esp32s31_boot_hart_only();
+	return ret;
 }

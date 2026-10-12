@@ -144,10 +144,12 @@ void ipi_mux_process(void)
 /**
  * ipi_mux_pending - Check whether any enabled vIPI is still pending
  *
- * A level-triggered parent IPI must stay asserted while any mux reason is
- * pending and enabled.  Called by the parent irqchip after it has consumed
- * the mux reasons so it can re-assert the level instead of losing an IPI
- * that raced with the clear.
+ * Called by a parent irqchip whose IPI is a level that software clears,
+ * after ipi_mux_process(), so that it can process again instead of
+ * returning while a vIPI is pending.
+ *
+ * Context: parent IPI handler, after ipi_mux_create().
+ * Return: true if an enabled vIPI is pending on this CPU.
  */
 bool ipi_mux_pending(void)
 {
@@ -156,7 +158,6 @@ bool ipi_mux_pending(void)
 
 	return (atomic_read(&icpu->bits) & en) != 0;
 }
-EXPORT_SYMBOL_GPL(ipi_mux_pending);
 
 /**
  * ipi_mux_create - Create virtual IPIs multiplexed on top of a single

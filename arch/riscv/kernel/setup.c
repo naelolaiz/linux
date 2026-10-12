@@ -300,6 +300,11 @@ static void __init riscv_spinlock_init(void)
 		return;
 	}
 
+	if (IS_ENABLED(CONFIG_RISCV_AMO_SPINLOCKS)) {
+		pr_info("AMO test-and-set spinlock: enabled\n");
+		return;
+	}
+
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZABHA) &&
 	    IS_ENABLED(CONFIG_RISCV_ISA_ZACAS) &&
 	    IS_ENABLED(CONFIG_TOOLCHAIN_HAS_ZACAS) &&
@@ -373,9 +378,8 @@ void __init setup_arch(char **cmdline_p)
 	apply_boot_alternatives();
 	init_rt_signal_env();
 
-	if ((IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
-	     riscv_isa_extension_available(NULL, ZICBOM)) ||
-	    IS_ENABLED(CONFIG_ESP32S31_CACHE))
+	if (IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
+	    riscv_isa_extension_available(NULL, ZICBOM))
 		riscv_noncoherent_supported();
 	/*
 	 * The ESP32-S31 has no Zicbom: its DMA cache maintenance goes through

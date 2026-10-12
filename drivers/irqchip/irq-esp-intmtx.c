@@ -12,13 +12,15 @@
  * This driver hangs underneath irq-esp-clic in the irq-domain
  * hierarchy. DT peripherals reference INTMTX with their ETS source
  * number + trigger type; alloc picks a free CLIC slot from a bitmap
- * (slots 16-31 — limited by riscv-intc's 32-hwirq cap on RV32),
+ * (slots 16-47 without the per-hart slots 40 and 41),
  * programs the matrix, and forwards the request to the CLIC layer
- * with the slot number as parent hwirq. mask/unmask/set_type pass through
- * to the parent (CLIC) chip; INTMTX itself has no per-source gate.
+ * with the slot number as parent hwirq. mask/unmask/set_type pass
+ * through to the parent (CLIC) chip; INTMTX itself has no per-source
+ * gate.
  *
- * Generic device routes use the official core0-only path. The SMP companion
- * owns the parallel core1 matrix solely for per-hart timer and IPI routes.
+ * Device interrupts are routed in core 0's table only and stay on hart 0.
+ * Core 1's table, 0x800 above, only carries the per-hart routes of the
+ * cross-core IPI and the timer (esp_intmtx_route_local()).
  */
 
 #include <linux/bitmap.h>
@@ -30,7 +32,6 @@
 #include <linux/of_address.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
-#include <linux/syscore_ops.h>
 
 #include "irq-esp32s31-internal.h"
 
@@ -41,18 +42,20 @@
 #define INTMTX_PASS_LEVEL_MASK	(0x3U << INTMTX_PASS_LEVEL_SHIFT)
 #define INTMTX_PASS_LEVEL_S	(0x1U << INTMTX_PASS_LEVEL_SHIFT)
 
-/* External CLIC slots available to Linux; 40/41 are reserved below. */
+/* Core 1's table follows core 0's. */
+#define INTMTX_CORE_STRIDE	0x800U
+
+/* CLIC slots for devices: 16-47, 40 and 41 reserved at init. */
 #define CLIC_SLOT_FIRST		ESP32S31_CLIC_EXT_FIRST
 #define CLIC_SLOT_LAST		ESP32S31_CLIC_EXT_LAST
 #define CLIC_SLOT_COUNT		(CLIC_SLOT_LAST - CLIC_SLOT_FIRST + 1U)
 
-#define INTMTX_CORE_STRIDE	0x800U
-
-/* ESP-IDF's esp32s31 interrupt table contains sources 0..177.  Each hart's
- * matrix bank has an 0x800-byte window, so all 178 32-bit route registers fit
- * before the next hart bank.  In particular BLE also uses source 133
- * (MODEM_BT_MAC_INT1), which must not be clipped to the older 128-source
- * assumption. */
+/*
+ * ESP-IDF's esp32s31 interrupt table contains sources 0..177, and the radio
+ * asks for sources by IDF number (Wi-Fi uses 120; the blob picks the others
+ * at run time). Each hart's matrix bank has an 0x800-byte window, so all 178
+ * 32-bit route registers fit before the next hart bank.
+ */
 #define INTMTX_MAX_SRC		177U
 
 struct esp_intmtx {
@@ -63,37 +66,6 @@ struct esp_intmtx {
 };
 
 static struct esp_intmtx *intmtx;
-static u32 intmtx_saved[2][INTMTX_MAX_SRC + 1];
-
-static int esp_intmtx_syscore_suspend(void)
-{
-	unsigned int cpu, src;
-
-	if (!intmtx)
-		return 0;
-	for (cpu = 0; cpu < 2; cpu++)
-		for (src = 0; src <= INTMTX_MAX_SRC; src++)
-			intmtx_saved[cpu][src] = readl_relaxed(intmtx->base +
-				cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
-	return 0;
-}
-
-static void esp_intmtx_syscore_resume(void)
-{
-	unsigned int cpu, src;
-
-	if (!intmtx)
-		return;
-	for (cpu = 0; cpu < 2; cpu++)
-		for (src = 0; src <= INTMTX_MAX_SRC; src++)
-			writel_relaxed(intmtx_saved[cpu][src], intmtx->base +
-				cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(src));
-}
-
-static struct syscore_ops esp_intmtx_syscore_ops = {
-	.suspend = esp_intmtx_syscore_suspend,
-	.resume = esp_intmtx_syscore_resume,
-};
 
 static int esp_intmtx_alloc_slot(struct esp_intmtx *priv)
 {
@@ -114,8 +86,9 @@ static void esp_intmtx_free_slot(struct esp_intmtx *priv, unsigned int slot)
 	clear_bit(slot - CLIC_SLOT_FIRST, priv->slots_in_use);
 }
 
+/* Device routes exist in core 0's table only. */
 static int esp_intmtx_set_affinity(struct irq_data *d,
-				    const struct cpumask *mask, bool force)
+				   const struct cpumask *mask, bool force)
 {
 	if (!cpumask_test_cpu(0, mask))
 		return -EINVAL;
@@ -133,6 +106,13 @@ static struct irq_chip esp_intmtx_chip = {
 	.flags		= IRQCHIP_SKIP_SET_WAKE,
 };
 
+/*
+ * Route @source to CLIC @slot in @cpu's table, for the per-hart IPI and
+ * timer. These enter Linux directly from the hart's own S-mode CLIC bank,
+ * which needs PASS_LEVEL_S in the route; the device routes work without.
+ * No lock: register 33 + n or 65 + n of table n is written only by hart
+ * n's own hotplug callbacks, and no device interrupt is mapped on it.
+ */
 void esp_intmtx_route_local(unsigned int cpu, unsigned int source,
 			    unsigned int slot)
 {
@@ -143,13 +123,7 @@ void esp_intmtx_route_local(unsigned int cpu, unsigned int source,
 			 slot > INTMTX_SLOT_MASK))
 		return;
 
-	/*
-	 * Unlike the official hart0 device path, the SMP-local timer and IPI
-	 * routes enter Linux directly from the per-hart S-mode CLIC bank.  S31
-	 * therefore requires PASS_LEVEL_S on these routes.
-	 */
-	reg = intmtx->base + cpu * INTMTX_CORE_STRIDE +
-	      INTMTX_SRC_REG(source);
+	reg = intmtx->base + cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(source);
 	val = readl_relaxed(reg);
 	val &= ~(INTMTX_SLOT_MASK | INTMTX_PASS_LEVEL_MASK);
 	val |= (slot & INTMTX_SLOT_MASK) | INTMTX_PASS_LEVEL_S;
@@ -164,8 +138,7 @@ void esp_intmtx_unroute_local(unsigned int cpu, unsigned int source)
 	if (WARN_ON_ONCE(!intmtx || cpu > 1 || source > INTMTX_MAX_SRC))
 		return;
 
-	reg = intmtx->base + cpu * INTMTX_CORE_STRIDE +
-	      INTMTX_SRC_REG(source);
+	reg = intmtx->base + cpu * INTMTX_CORE_STRIDE + INTMTX_SRC_REG(source);
 	val = readl_relaxed(reg);
 	val &= ~(INTMTX_SLOT_MASK | INTMTX_PASS_LEVEL_MASK);
 	writel_relaxed(val, reg);
@@ -272,6 +245,7 @@ static int __init esp_intmtx_init(struct device_node *node,
 	struct irq_domain *parent_domain, *domain;
 	struct esp_intmtx *priv;
 	unsigned int src;
+	int ret;
 
 	if (intmtx) {
 		pr_err("esp-intmtx: already initialised\n");
@@ -295,20 +269,23 @@ static int __init esp_intmtx_init(struct device_node *node,
 		return -ENXIO;
 	}
 	raw_spin_lock_init(&priv->lock);
-	set_bit(ESP32S31_CLIC_IPI_SLOT - CLIC_SLOT_FIRST,
-		priv->slots_in_use);
-	set_bit(ESP32S31_CLIC_TIMER_SLOT - CLIC_SLOT_FIRST,
-		priv->slots_in_use);
+	set_bit(ESP32S31_CLIC_IPI_SLOT - CLIC_SLOT_FIRST, priv->slots_in_use);
+	set_bit(ESP32S31_CLIC_TIMER_SLOT - CLIC_SLOT_FIRST, priv->slots_in_use);
 
 	/* Clear every source's slot routing so we start from a known
 	 * state — anything OpenSBI or the chip ROM left in place is
-	 * unmapped here.
+	 * unmapped here. Core 1's table too: OpenSBI does not clear it, and
+	 * a stale route to slot 40 or 41 would interrupt hart 1 as soon as
+	 * it enables that slot.
 	 */
-	for (src = 0; src <= INTMTX_MAX_SRC; src++)
+	for (src = 0; src <= INTMTX_MAX_SRC; src++) {
 		writel_relaxed(0, priv->base + INTMTX_SRC_REG(src));
+		if (IS_ENABLED(CONFIG_SMP))
+			writel_relaxed(0, priv->base + INTMTX_CORE_STRIDE +
+				       INTMTX_SRC_REG(src));
+	}
 
 	intmtx = priv;
-	register_syscore_ops(&esp_intmtx_syscore_ops);
 
 	domain = irq_domain_create_hierarchy(parent_domain, 0,
 					     INTMTX_MAX_SRC + 1,
@@ -321,18 +298,16 @@ static int __init esp_intmtx_init(struct device_node *node,
 		return -ENOMEM;
 	}
 
-	if (IS_ENABLED(CONFIG_SMP)) {
-		int ret = esp32s31_smp_irq_init();
+	pr_info("esp-intmtx: %u sources, parent %pOF; %u CLIC slots available\n",
+		INTMTX_MAX_SRC + 1, parent, CLIC_SLOT_COUNT - 2);
 
-		if (ret) {
-			pr_err("esp-intmtx: failed to initialize SMP local IRQs: %d\n",
-			       ret);
-			return ret;
-		}
-	}
-
-	pr_info("esp-intmtx: %u sources, parent %pOF; %u device slots, hart0 pinned\n",
-		 INTMTX_MAX_SRC + 1, parent, CLIC_SLOT_COUNT - 2);
+	/*
+	 * The cross-core IPI needs both tables. Device interrupts keep
+	 * working on hart 0 if it fails.
+	 */
+	ret = esp32s31_smp_irq_init();
+	if (ret)
+		pr_err("esp-intmtx: no cross-core IPI: %d\n", ret);
 	return 0;
 }
 

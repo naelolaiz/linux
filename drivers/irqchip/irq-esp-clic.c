@@ -35,7 +35,6 @@
 #include <linux/of_irq.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
-#include <linux/syscore_ops.h>
 
 #include "irq-esp32s31-internal.h"
 
@@ -75,104 +74,26 @@ struct esp_clic {
 };
 
 static struct esp_clic *clic;
-static inline void __iomem *esp_clic_hart_reg(struct esp_clic *priv,
-					       unsigned int cpu,
-					       unsigned int off);
-static u8 clic_saved_ie[2][CLIC_EXT_LAST + 1];
-
-static int esp_clic_syscore_suspend(void)
-{
-	unsigned int cpu, slot;
-
-	if (!clic)
-		return 0;
-	for (cpu = 0; cpu < 2; cpu++)
-		for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++)
-			clic_saved_ie[cpu][slot] =
-				readb_relaxed(esp_clic_hart_reg(clic, cpu,
-						      CLIC_INTIE_OFF(slot)));
-	return 0;
-}
-
-static void esp_clic_syscore_resume(void)
-{
-	unsigned int cpu, slot;
-
-	if (!clic)
-		return;
-	for (cpu = 0; cpu < 2; cpu++) {
-		for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++) {
-			writeb_relaxed(0, esp_clic_hart_reg(clic, cpu,
-						       CLIC_INTIE_OFF(slot)));
-			writeb_relaxed(0, esp_clic_hart_reg(clic, cpu,
-						       CLIC_INTIP_OFF(slot)));
-			writeb_relaxed(CLIC_ATTR_MODE_S | CLIC_ATTR_TRIG_LEVEL,
-				esp_clic_hart_reg(clic, cpu,
-						  CLIC_INTATTR_OFF(slot)));
-			writeb_relaxed(CLIC_CTL_MAX_PRIO,
-				esp_clic_hart_reg(clic, cpu,
-						  CLIC_INTCTL_OFF(slot)));
-			writeb_relaxed(clic_saved_ie[cpu][slot] & 1,
-				esp_clic_hart_reg(clic, cpu,
-						  CLIC_INTIE_OFF(slot)));
-		}
-	}
-}
-
-static struct syscore_ops esp_clic_syscore_ops = {
-	.suspend = esp_clic_syscore_suspend,
-	.resume = esp_clic_syscore_resume,
-};
 
 static inline unsigned int slot_to_idx(unsigned int slot)
 {
 	return slot - CLIC_EXT_FIRST;
 }
 
+/*
+ * Register @off of @cpu's S-mode bank. Called with preemption or interrupts
+ * off (irq_chip callbacks under the descriptor lock, CPU hotplug STARTING
+ * callbacks, the domain alloc), so the current CPU cannot change under us.
+ */
 static inline void __iomem *esp_clic_hart_reg(struct esp_clic *priv,
 					       unsigned int cpu,
 					       unsigned int off)
 {
 	void __iomem *base = priv->base;
 
-	if (cpu != raw_smp_processor_id())
+	if (cpu != smp_processor_id())
 		base += CLIC_OTHER_HART_OFF;
 	return base + off;
-}
-
-u32 esp_clic_pending_mask(unsigned int cpu)
-{
-	u32 pending = 0;
-	unsigned int slot;
-
-	/* All normal device IRQs are deliberately pinned to hart 0. */
-	if (unlikely(!clic || cpu != 0))
-		return 0;
-
-	for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++) {
-		if (slot == ESP32S31_CLIC_IPI_SLOT ||
-		    slot == ESP32S31_CLIC_TIMER_SLOT)
-			continue;
-		/* Avoid two MMIO reads for every unallocated CLIC slot. */
-		if (!clic->intc_virqs[slot_to_idx(slot)])
-			continue;
-		if ((readb_relaxed(esp_clic_hart_reg(clic, cpu,
-						 CLIC_INTIP_OFF(slot))) & 1) &&
-		    (readb_relaxed(esp_clic_hart_reg(clic, cpu,
-						 CLIC_INTIE_OFF(slot))) & 1))
-			pending |= BIT(slot - CLIC_EXT_FIRST);
-	}
-	return pending;
-}
-
-void esp_clic_handle_pending(u32 pending)
-{
-	unsigned int bit;
-
-	if (unlikely(!clic))
-		return;
-	for_each_set_bit(bit, (unsigned long *)&pending, CLIC_EXT_COUNT)
-		generic_handle_domain_irq(clic->domain, CLIC_EXT_FIRST + bit);
 }
 
 static void esp_clic_mask(struct irq_data *d)
@@ -248,8 +169,11 @@ static int esp_clic_install_chained(struct esp_clic *priv, unsigned int slot)
 	return 0;
 }
 
-int esp_clic_install_local(unsigned int slot,
-			   void (*handler)(struct irq_desc *), void *data)
+/*
+ * Map per-hart @slot in the hart-local interrupt domain, where every
+ * interrupt is per-CPU: the caller can request_percpu_irq() the result.
+ */
+int esp_clic_map_local(unsigned int slot)
 {
 	unsigned int idx, intc_virq;
 
@@ -264,8 +188,19 @@ int esp_clic_install_local(unsigned int slot,
 	if (!intc_virq)
 		return -ENXIO;
 
-	irq_set_chained_handler_and_data(intc_virq, handler, data);
 	clic->intc_virqs[idx] = intc_virq;
+	return intc_virq;
+}
+
+int esp_clic_install_local(unsigned int slot,
+			   void (*handler)(struct irq_desc *), void *data)
+{
+	int intc_virq = esp_clic_map_local(slot);
+
+	if (intc_virq < 0)
+		return intc_virq;
+
+	irq_set_chained_handler_and_data(intc_virq, handler, data);
 	return 0;
 }
 
@@ -311,11 +246,13 @@ static int esp_clic_domain_alloc(struct irq_domain *domain, unsigned int virq,
 		 * gets a handler, so the first unmask doesn't take a spurious
 		 * interrupt.
 		 */
-		writeb_relaxed(0, esp_clic_hart_reg(priv, 0,
-						  CLIC_INTIP_OFF(src)));
-		writeb_relaxed(CLIC_CTL_MAX_PRIO,
+		scoped_guard(preempt) {
+			writeb_relaxed(0, esp_clic_hart_reg(priv, 0,
+							    CLIC_INTIP_OFF(src)));
+			writeb_relaxed(CLIC_CTL_MAX_PRIO,
 				       esp_clic_hart_reg(priv, 0,
-						 CLIC_INTCTL_OFF(src)));
+							 CLIC_INTCTL_OFF(src)));
+		}
 
 		irq_domain_set_info(domain, virq + i, src, &esp_clic_chip,
 				    priv, handle_level_irq, NULL, NULL);
@@ -374,7 +311,6 @@ static int __init esp_clic_init(struct device_node *node,
 
 	priv->domain = domain;
 	clic = priv;
-	register_syscore_ops(&esp_clic_syscore_ops);
 
 	pr_info("esp-clic: %u external slots (IDs %u-%u), chained on %pOF\n",
 		CLIC_EXT_COUNT, CLIC_EXT_FIRST, CLIC_EXT_LAST, parent);
