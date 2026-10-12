@@ -26,17 +26,15 @@ int s31_radio_fw_reset(void);
 size_t s31_radio_fw_wifi_iram_size(void);
 int s31_radio_wifi_frontend_suspend(void);
 int s31_radio_wifi_frontend_resume(void);
-int s31_radio_btdm_frontend_suspend(void);
-int s31_radio_btdm_frontend_resume(void);
 int s31_radio_fw_load(struct device *device);
+int s31_radio_pmu_probe(struct device *dev);
+void s31_linux_pmu_reclaim_after_radio_init(void);
 void s31_radio_fw_unload(void);
 u32 *s31_radio_fw_isr_depth(void);
 void s31_radio_wifi_clock_enable(void);
 void s31_radio_wifi_clock_disable(void);
 int s31_radio_wifi_frontend_init(struct device *parent);
 void s31_radio_wifi_frontend_exit(void);
-int s31_radio_btdm_frontend_init(struct device *parent, bool direct_hci);
-void s31_radio_btdm_frontend_exit(void);
 
 /* Keep these values synchronized with radio_firmware/s31_rtos/s31_rtos.h. */
 enum s31_blob_release_reason {
@@ -163,7 +161,6 @@ size_t __wrap_heap_caps_get_free_size(u32 caps);
 void _interrupt_handler(void);
 void *intr_handler_get(int int_no);
 u32 __wrap_esp_log_timestamp(void);
-bool __wrap_esp_intr_ptr_in_isr_region(void *ptr);
 int __wrap_esp_intr_alloc(int source, int flags, void (*handler)(void *),
 			  void *arg, void **ret_handle);
 int __wrap_esp_intr_enable(void *handle);

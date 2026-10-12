@@ -8,9 +8,6 @@
 #include <asm/cacheflush.h>
 #include "esp32s31-radio-internal.h"
 #include "esp32s31-radio-xip.h"
-extern u8 esp32s31_radio_xip_ram[S31_XIP_RAM_SIZE];
-extern const void *esp32s31_radio_xip_get(void);
-extern void *esp32s31_radio_wifi_iram_get(void);
 extern const unsigned long _mtvt_table[48];
 static const struct s31_xip_header *s31_xip_image;
 struct s31_fw_import {

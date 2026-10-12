@@ -8,6 +8,7 @@
 #define _ASM_RISCV_PGALLOC_H
 
 #include <linux/mm.h>
+#include <asm/esp32s31-radio-map.h>
 #include <asm/sbi.h>
 #include <asm/tlb.h>
 
@@ -118,9 +119,9 @@ static inline void sync_kernel_mappings(pgd_t *pgd)
 	 */
 	{
 		static const unsigned long s31_platform_low_pgds[] = {
-			0x2c000000UL,
-			0x2f000000UL,
-			0x2f800000UL,
+			ESP32S31_CACHE_WINDOW,
+			ESP32S31_SRAM_WINDOW,
+			ESP32S31_ROM_WINDOW,
 		};
 		int i;
 

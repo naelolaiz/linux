@@ -1,26 +1,25 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-config ESP32S31_DT_OVERLAY
-	bool "ESP32-S31 transactional Device Tree overlay manager"
-	depends on SOC_ESP32S31
-	select OF_OVERLAY
+config ESP32S31_RADIO_XIP
+	bool
+	depends on ESP32S31_RADIO_SMODE
+	select CRC32
+	default y
 	help
-	  Exposes /dev/s31-overlay. A complete DTBO written to the device
-	  replaces the currently active overlay. Replacement is transactional:
-	  the previous overlay is restored if applying the new one fails.
+	  Fixed executable flash mapping and 40 KiB writable SRAM arena.
+	  The radio image and Linux module must be built together.
 
 config ESP32S31_RADIO_SMODE_DRIVER
 	tristate "ESP32-S31 S-mode radio runtime"
-	depends on ESP32S31_RADIO_SMODE
-	depends on BT && WLAN
-	select FUTEX
+	depends on ESP32S31_RADIO_XIP
+	depends on WLAN && m
 	select CFG80211
 	select MAC80211
 	help
 	  Build the reloadable esp32s31-radio.ko. It owns the shared PHY, SRAM,
-	  clocks and interrupts and exposes cfg80211 plus direct HCI from one
-	  module. mode=wifi, mode=bt, or mode=combo selects the runtime profile.
-	  The prelinked ESP-IDF closure runs from its fixed flash-XIP slot.
+	  clocks and interrupts and exposes cfg80211 from one module. The
+	  prelinked ESP-IDF closure (radio.bin) runs from its fixed flash-XIP
+	  slot. Built without Bluetooth: only mode=wifi works.
 
 config ESP32S31_WIFI_SOFTMAC
 	bool
@@ -29,15 +28,6 @@ config ESP32S31_WIFI_SOFTMAC
 	help
 	  Single-STA mac80211 bridge with native MAC CCMP, bounded TX
 	  aggregation and software replay/reorder checks on received frames.
-
-config ESP32S31_RADIO_XIP
-	bool
-	depends on SOC_ESP32S31 && XIP_KERNEL && 32BIT
-	select CRC32
-	default y
-	help
-	  Fixed executable flash mapping and 40 KiB writable SRAM arena.
-	  The radio image and Linux module must be built together.
 
 config ESP32S31_RADIO_BLOBS
 	bool
