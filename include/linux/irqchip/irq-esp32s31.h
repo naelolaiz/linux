@@ -10,6 +10,7 @@
 int esp32s31_local_timer_init(void);
 void esp32s31_local_timer_enable(unsigned int cpu);
 void esp32s31_local_timer_disable(unsigned int cpu);
+void esp32s31_irq_poll(void);
 #endif
 
 #endif /* __LINUX_IRQCHIP_IRQ_ESP32S31_H */

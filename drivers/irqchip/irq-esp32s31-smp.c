@@ -24,8 +24,10 @@
 #include <linux/irq.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqchip/irq-esp32s31.h>
+#include <linux/moduleparam.h>
 #include <linux/smp.h>
 
+#include <asm/esp-clic.h>
 #include <asm/smp.h>
 
 #include "irq-esp32s31-internal.h"
@@ -77,10 +79,66 @@ static void esp32s31_ipi_chained(struct irq_desc *desc)
 	chained_irq_exit(chip, desc);
 }
 
+/*
+ * Idle-poll counts per CPU, read-only in
+ * /sys/module/irq_esp32s31_smp/parameters/: idle_poll_drops counts the
+ * polls that found a CLIC slot pending and lowered the level,
+ * idle_poll_stuck those that found a slot still pending from the poll
+ * before, and idle_poll_stuck_slots holds the slots of the last of those
+ * (bit n is CLIC ID n + 16). A hart whose level is lowered at every
+ * interrupt and idle entry takes a pending interrupt before a poll can
+ * see it, so both counts should stay near 0.
+ */
+static unsigned int idle_poll_drops[NR_CPUS];
+static unsigned int idle_poll_stuck[NR_CPUS];
+static unsigned int idle_poll_stuck_slots[NR_CPUS];
+module_param_array(idle_poll_drops, uint, NULL, 0444);
+module_param_array(idle_poll_stuck, uint, NULL, 0444);
+module_param_array(idle_poll_stuck_slots, hexint, NULL, 0444);
+
+/**
+ * esp32s31_irq_poll - let the idle loop take what is pending
+ *
+ * The idle loop enters wfi with interrupts off, and in that state a
+ * doorbell does not wake the hart: an IPI to an idle hart is stranded.
+ * With both harts up they idle by polling with interrupts on instead
+ * (esp32s31_ipi_starting_cpu()). A hart can also be left unable to take
+ * an interrupt that is pending, with the CLIC's S-mode level stuck at
+ * its 0xff sentinel; the polling loop calls this to lower the level when
+ * something is pending, and the hart then takes it as a normal interrupt.
+ * Both from GrieferPig's linux-esp32-s31, where this poll runs the
+ * pending handlers itself.
+ */
+void esp32s31_irq_poll(void)
+{
+	static u64 last_pending[NR_CPUS];
+	unsigned long flags;
+	unsigned int cpu;
+	u64 pending, stuck;
+
+	raw_local_irq_save(flags);
+	cpu = smp_processor_id();
+	pending = esp_clic_pending_local();
+	if (pending) {
+		idle_poll_drops[cpu]++;
+		stuck = pending & last_pending[cpu];
+		if (stuck) {
+			idle_poll_stuck[cpu]++;
+			idle_poll_stuck_slots[cpu] = stuck >> ESP32S31_CLIC_EXT_FIRST;
+		}
+		esp_clic_drop_level();
+	}
+	last_pending[cpu] = pending;
+	raw_local_irq_restore(flags);
+}
+
 static int esp32s31_ipi_starting_cpu(unsigned int cpu)
 {
 	if (cpu >= ESP32S31_NR_HARTS)
 		return -EINVAL;
+
+	if (cpu)
+		cpu_idle_poll_ctrl(true);
 
 	writel(0, esp32s31_doorbell(cpu));
 	esp_intmtx_route_local(cpu, ESP32S31_IPI_SOURCE(cpu),
@@ -94,6 +152,8 @@ static int esp32s31_ipi_dying_cpu(unsigned int cpu)
 	esp_clic_configure_local(cpu, ESP32S31_CLIC_IPI_SLOT, false);
 	esp_intmtx_unroute_local(cpu, ESP32S31_IPI_SOURCE(cpu));
 	writel(0, esp32s31_doorbell(cpu));
+	if (cpu)
+		cpu_idle_poll_ctrl(false);
 	return 0;
 }
 
