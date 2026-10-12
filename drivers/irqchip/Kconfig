@@ -660,7 +660,7 @@ config STARFIVE_JH8100_INTC
 
 config ESP_CLIC
 	bool "Espressif ESP32-S31 CLIC S-mode irqchip"
-	depends on RISCV
+	depends on ARCH_ESPRESSIF
 	select IRQ_DOMAIN_HIERARCHY
 	select RISCV_ESP_CLIC_TRAP_QUIRK
 	help
@@ -668,7 +668,8 @@ config ESP_CLIC
 	  so Linux can take external peripheral interrupts. OpenSBI is
 	  responsible for delegating the CLIC external sources to S-mode
 	  at boot; this driver owns enable/mask/priority/trigger from
-	  there.
+	  there. It selects RISCV_ESP_CLIC_TRAP_QUIRK, which changes the
+	  trap, idle and SBI call paths of the whole kernel.
 
 	  If unsure, say N.
 

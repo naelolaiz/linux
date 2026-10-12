@@ -27,6 +27,7 @@
 #include <asm/bug.h>
 #include <asm/cfi.h>
 #include <asm/csr.h>
+#include <asm/esp-clic.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 #include <asm/smp.h>
@@ -437,6 +438,14 @@ static void noinstr handle_riscv_irq(struct pt_regs *regs)
 	old_regs = set_irq_regs(regs);
 	handle_arch_irq(regs);
 	set_irq_regs(old_regs);
+	/*
+	 * Taking the interrupt raised the CLIC level. Lower it before
+	 * irq_exit_rcu(), which runs softirqs with interrupts on: the sret
+	 * that would lower it comes only at the end, and may come after the
+	 * return to user mode has scheduled another task, and that one gone
+	 * idle, with every interrupt masked.
+	 */
+	esp_clic_drop_level();
 	irq_exit_rcu();
 }
 

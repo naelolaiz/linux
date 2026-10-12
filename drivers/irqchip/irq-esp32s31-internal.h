@@ -19,6 +19,7 @@ struct irq_desc;
 int esp_clic_map_local(unsigned int slot);
 int esp_clic_install_local(unsigned int slot,
 			   void (*handler)(struct irq_desc *), void *data);
+u64 esp_clic_pending_local(void);
 void esp_clic_configure_local(unsigned int cpu, unsigned int slot,
 			      bool enable);
 void esp_intmtx_route_local(unsigned int cpu, unsigned int source,

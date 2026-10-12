@@ -76,7 +76,6 @@ static int __init cpu_idle_nopoll_setup(char *__unused)
 __setup("hlt", cpu_idle_nopoll_setup);
 #endif /* CONFIG_GENERIC_IDLE_POLL_SETUP */
 
-void arch_cpu_idle_poll(void);
 void __weak arch_cpu_idle_poll(void) { }
 
 static noinline int __cpuidle cpu_idle_poll(void)

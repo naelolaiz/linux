@@ -204,6 +204,35 @@ int esp_clic_install_local(unsigned int slot,
 	return 0;
 }
 
+/*
+ * Slots pending and enabled in this hart's bank, as bits 16-47: device
+ * slots on hart 0, which takes them all, and the per-hart slots on any
+ * hart. Called with interrupts off.
+ */
+u64 esp_clic_pending_local(void)
+{
+	unsigned int cpu = smp_processor_id();
+	unsigned int slot;
+	u64 pending = 0;
+
+	if (!clic)
+		return 0;
+
+	for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++) {
+		if (!clic->intc_virqs[slot_to_idx(slot)])
+			continue;
+		if (cpu && slot != ESP32S31_CLIC_IPI_SLOT &&
+		    slot != ESP32S31_CLIC_TIMER_SLOT)
+			continue;
+		if ((readb_relaxed(esp_clic_hart_reg(clic, cpu,
+						     CLIC_INTIP_OFF(slot))) & 1) &&
+		    (readb_relaxed(esp_clic_hart_reg(clic, cpu,
+						     CLIC_INTIE_OFF(slot))) & 1))
+			pending |= BIT_ULL(slot);
+	}
+	return pending;
+}
+
 void esp_clic_configure_local(unsigned int cpu, unsigned int slot, bool enable)
 {
 	if (WARN_ON_ONCE(!clic || cpu >= nr_cpu_ids ||
