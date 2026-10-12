@@ -41,7 +41,7 @@
 
 	chosen {
 		bootargs =
-		"earlycon=sbi console=ttyS0 root=mtd:rootfs rootfstype=cramfs ro swiotlb=128";
+		"earlycon=sbi console=ttyS0 root=mtd:rootfs rootfstype=cramfs ro swiotlb=128,1";
 	};
 
 	cpus {
@@ -57,6 +57,7 @@
 			riscv,isa-base = "rv32i";
 			riscv,isa-extensions = "i", "m", "a", "f", "c", "zicsr",
 					       "zifencei";
+			riscv,cbom-block-size = <64>;
 			mmu-type = "riscv,sv32";
 			clock-frequency = <320000000>;
 
