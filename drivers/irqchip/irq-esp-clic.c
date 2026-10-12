@@ -204,6 +204,21 @@ int esp_clic_install_local(unsigned int slot,
 	return 0;
 }
 
+#ifdef CONFIG_ESP32S31_SMP_LOCKUP_REPORT
+/* Pending and enable bytes of @slot in hart @cpu's bank, for lockup reports. */
+void esp_clic_local_state(unsigned int cpu, unsigned int slot, u8 *ip, u8 *ie)
+{
+	*ip = *ie = 0xff;
+	if (!clic || cpu >= nr_cpu_ids ||
+	    slot < CLIC_EXT_FIRST || slot > CLIC_EXT_LAST)
+		return;
+
+	guard(preempt)();
+	*ip = readb_relaxed(esp_clic_hart_reg(clic, cpu, CLIC_INTIP_OFF(slot)));
+	*ie = readb_relaxed(esp_clic_hart_reg(clic, cpu, CLIC_INTIE_OFF(slot)));
+}
+#endif
+
 /*
  * Slots pending and enabled in this hart's bank, as bits 16-47: device
  * slots on hart 0, which takes them all, and the per-hart slots on any

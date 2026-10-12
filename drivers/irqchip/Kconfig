@@ -697,6 +697,18 @@ config ESP32S31_SMP
 	  systimer comparator interrupt. Both are routed through each hart's
 	  own CLIC bank and INTMTX table.
 
+config ESP32S31_SMP_LOCKUP_REPORT
+	bool "ESP32-S31 lockup report from the bus monitor"
+	depends on ESP32S31_SMP && DEBUG_KERNEL
+	help
+	  Debug aid for two-hart ESP32-S31 kernels. Turn on the chip's bus
+	  monitor at boot. On a backtrace request (hard lockup detector,
+	  RCU stall, SysRq-l), print the PC samples, SP, last exception PC,
+	  doorbell and CLIC IPI/timer state of each hart that does not
+	  answer the backtrace IPI within one second.
+
+	  If unsure, say N.
+
 config ACLINT_SSWI
 	bool "RISC-V ACLINT S-mode IPI Interrupt Controller"
 	depends on RISCV
