@@ -2,14 +2,14 @@
 #ifndef _LINUX_ESP32S31_RADIO_H
 #define _LINUX_ESP32S31_RADIO_H
 
+#include <linux/cpu.h>
+#include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/esp32s31-radio-control.h>
 
 struct device;
 struct sk_buff;
 
-/* The SoftMAC association toggles the CPU0 IRQ-latency idle policy. */
-void esp32s31_radio_idle_poll_set(bool active);
 /* Internal frontend hint; publish while holding the RX ring lock. */
 void s31_radio_softmac_rx_pending_set(bool pending);
 
@@ -149,9 +149,21 @@ int s31_radio_wifi_frontend_init(struct device *parent);
 void s31_radio_wifi_frontend_exit(void);
 int s31_radio_wifi_frontend_suspend(void);
 int s31_radio_wifi_frontend_resume(void);
+#if IS_ENABLED(CONFIG_BT_ESP32S31)
 int s31_radio_btdm_frontend_init(struct device *parent, bool direct_hci);
 void s31_radio_btdm_frontend_exit(void);
 int s31_radio_btdm_frontend_suspend(void);
 int s31_radio_btdm_frontend_resume(void);
+#else
+/* Built without the Bluetooth frontend: only mode=wifi is accepted. */
+static inline int s31_radio_btdm_frontend_init(struct device *parent,
+					       bool direct_hci)
+{
+	return -EOPNOTSUPP;
+}
+static inline void s31_radio_btdm_frontend_exit(void) { }
+static inline int s31_radio_btdm_frontend_suspend(void) { return 0; }
+static inline int s31_radio_btdm_frontend_resume(void) { return 0; }
+#endif
 
 #endif /* _LINUX_ESP32S31_RADIO_H */

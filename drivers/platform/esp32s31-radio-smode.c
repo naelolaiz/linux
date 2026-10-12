@@ -5,7 +5,6 @@
 #include <linux/bitmap.h>
 #include <linux/completion.h>
 #include <linux/cpu.h>
-#include <linux/soc/espressif/esp32s31-pm.h>
 #include <linux/if_ether.h>
 #include <linux/genalloc.h>
 #include <linux/delay.h>
@@ -47,10 +46,6 @@ u64 s31_linux_wall_time_seconds(void)
 {
 	return ktime_get_real_seconds();
 }
-
-#ifdef CONFIG_SMP
-extern void esp32s31_irq_poll(void);
-#endif
 
 #define S31_ROM_BASE		0x2f800000UL
 #define S31_ROM_CPU_FREQ	0x2f800040UL
@@ -606,23 +601,6 @@ u32 __wrap_esp_log_timestamp(void)
 	/* Linux deliberately starts jiffies near UINT_MAX to expose wrap bugs.
 	 * IDF logs expect milliseconds since boot, not raw Linux jiffies. */
 	return div_u64(ktime_get_mono_fast_ns(), NSEC_PER_MSEC);
-}
-
-/*
- * IDF's interrupt allocator normally accepts ISR code only from its IRAM and
- * mask-ROM address windows.  The radio objects are built into Linux .text in
- * this configuration, which is resident executable memory as well.  Keep the
- * allocator's IRAM-safety check, but teach it about the new owner/address
- * space through the link-time wrapper.
- */
-bool __wrap_esp_intr_ptr_in_isr_region(void *ptr)
-{
-	unsigned long addr = (unsigned long)ptr;
-
-	/* ESP32-S31 executes the XIP kernel from its permanent 0xc0000000
-	 * mapping; core_kernel_text() does not include that architecture-specific
-	 * alias.  The radio payload's IRAM-attributed handlers live there. */
-	return esp32s31_executable_address(addr);
 }
 
 struct s31_idf_irq_registration {
@@ -1277,7 +1255,7 @@ static void s31_radio_sync_one_irq(struct s31_idf_irq_registration *registration
 		 * peripheral source, not a CLIC slot.  INTMTX selects a free CLIC
 		 * slot and pins the resulting device IRQ to hart 0. */
 		intmtx_node = of_find_compatible_node(NULL, NULL,
-						 "espressif,esp32s31-intmtx");
+						 "esp,esp32s31-intmtx");
 		if (!intmtx_node) {
 			pr_err_ratelimited("esp32s31-radio: cannot find S-mode INTMTX domain\n");
 			return;
@@ -1397,7 +1375,13 @@ static void s31_radio_control_kick(void)
 {
 	if (READ_ONCE(s31_radio_workerless) &&
      atomic_read(&s31_radio_state) != ESP32S31_RADIO_OFFLINE)
-		queue_work_on(0, system_dfl_wq, &s31_radio_control_work);
+		/*
+		 * A bound worker: the payload context of a caller that is not
+		 * a compat task lives in a per-CPU slot, so the work must not
+		 * move to hart 1 halfway. system_dfl_wq is unbound and would
+		 * take the 0 only as a hint.
+		 */
+		queue_work_on(0, system_percpu_wq, &s31_radio_control_work);
 }
 
 static void s31_radio_submit_command(struct s31_radio_command *command)
@@ -2862,14 +2846,6 @@ static int s31_radio_runtime_thread(void *unused)
 	for (;;) {
 		s31_radio_sync_irq_registrations();
 		s31_radio_update_state();
-#ifdef CONFIG_SMP
-		/* A direct S-mode CLIC source can remain pending after an SBI cache
-		 * ecall because of S31's cross-privilege 0xff sentinel.  The radio
-		 * worker keeps hart 0 runnable, so the idle poll fallback never gets
-		 * a chance to drain it.  Service pending native sources at this bounded
-		 * scheduling point; their direct hardware paths remain the fast path. */
-		esp32s31_irq_poll();
-#endif
 		if (!s31_radio_worker_stack &&
 		    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
 			s31_radio_worker_stack =

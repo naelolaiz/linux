@@ -125,11 +125,17 @@
 		#size-cells = <1>;
 		ranges;
 
-		dma_pool: dma-pool@2f030000 {
+		/*
+		 * Coherent DMA memory for the EMAC rings and the USB host. It stays
+		 * in internal SRAM, which the data cache does not cover, and is kept
+		 * small so that 0x2f030000-0x2f072380 and 0x2f078c00-0x2f07cfb0 stay
+		 * free for the Wi-Fi radio code.
+		 */
+		dma_pool: dma-pool@2f073000 {
 			compatible = "shared-dma-pool";
 			linux,dma-default;
 			no-map;
-			reg = <0x2f030000 0x40000>;
+			reg = <0x2f073000 0x5000>;
 		};
 	};
 
@@ -415,6 +421,28 @@
 			linux,mtd-name = "rootfs";
 			#address-cells = <1>;
 			#size-cells = <1>;
+		};
+	};
+
+	/*
+	 * Wi-Fi radio run by esp32s31-radio.ko. The ESP-IDF radio
+	 * libraries execute in place from the radio's flash slot
+	 * (drivers/platform/esp32s31-radio-xip.h) and use HP SRAM
+	 * (S31_RADIO_HEAP* in drivers/platform/esp32s31-radio-smode.c)
+	 * directly through the kernel's identity maps
+	 * (ESP32S31_RADIO_SMODE), not through DT resources. Interrupts
+	 * are allocated at run time from &intmtx by ESP-IDF source number.
+	 */
+	radio: radio {
+		compatible = "esp,esp32s31-radio";
+
+		wifi {
+			compatible = "esp,esp32s31-wifi";
+		};
+
+		bluetooth {
+			compatible = "esp,esp32s31-btdm";
+			status = "disabled";
 		};
 	};
 };

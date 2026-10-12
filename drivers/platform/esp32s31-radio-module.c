@@ -17,7 +17,7 @@ const char s31_radio_modinfo_anchor[] __used __section(".modinfo") =
 static bool s31_radio_started;
 static bool s31_radio_suspended;
 static u32 s31_radio_configured_features;
-static char *s31_radio_mode = "combo";
+static char *s31_radio_mode = "wifi";
 static bool s31_radio_direct_hci = true;
 module_param_named(mode, s31_radio_mode, charp, 0400);
 MODULE_PARM_DESC(mode, "radio profile: wifi, bt, or combo");
@@ -76,6 +76,8 @@ static int s31_radio_parse_mode(bool *enable_wifi, bool *enable_bt)
 	} else {
 		return -EINVAL;
 	}
+	if (*enable_bt && !IS_ENABLED(CONFIG_BT_ESP32S31))
+		return -EOPNOTSUPP;
 	return 0;
 }
 
@@ -87,11 +89,16 @@ static int esp32s31_radio_probe(struct platform_device *pdev)
 	ret = s31_radio_parse_mode(&enable_wifi, &enable_bt);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
+				     ret == -EOPNOTSUPP ?
+				     "mode=%s needs Bluetooth, which this kernel is built without\n" :
 				     "invalid mode=%s (expected wifi, bt, or combo)\n",
 				     s31_radio_mode);
 	if (s31_radio_started)
 		return dev_err_probe(&pdev->dev, -EBUSY,
 				     "radio runtime already started\n");
+	ret = s31_radio_pmu_probe(&pdev->dev);
+	if (ret)
+		return ret;
 
 	s31_radio_configured_features =
 		(enable_wifi ? S31_RADIO_FEATURE_WIFI : 0) |
@@ -260,6 +267,7 @@ static DEFINE_SIMPLE_DEV_PM_OPS(esp32s31_radio_pm_ops,
 					esp32s31_radio_suspend, esp32s31_radio_resume);
 
 static const struct of_device_id esp32s31_radio_of_match[] = {
+	{ .compatible = "esp,esp32s31-radio" },
 	{ .compatible = "espressif,esp32s31-radio" },
 	{ }
 };

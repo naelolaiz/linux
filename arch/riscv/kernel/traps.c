@@ -171,80 +171,64 @@ DO_ERROR_INFO(do_trap_insn_misaligned,
 DO_ERROR_INFO(do_trap_insn_fault,
 	SIGSEGV, SEGV_ACCERR, "instruction access fault");
 
-static bool esp32s31_hart0_pie_insn(struct pt_regs *regs)
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+/*
+ * ESP-IDF's PM implementation has one otherwise harmless M-mode read of
+ * mhartid in do_switch().  The radio objects now execute as part of the
+ * S-mode kernel, where that CSR correctly traps.  Emulate the read from
+ * Linux's logical-CPU-to-hart map instead of carrying a board-specific
+ * binary patch.  Match only CSRRS rd,mhartid,x0 (the canonical
+ * `csrr rd, mhartid` encoding), and never expose it to userspace.
+ */
+static __always_inline bool esp32s31_emulate_mhartid(struct pt_regs *regs)
 {
+	unsigned int rd;
+	u16 lo, hi;
 	u32 insn;
 
-	if (!IS_ENABLED(CONFIG_ESP32S31_RADIO_SMODE))
-		return false;
-	if (raw_smp_processor_id() != 0 || !user_mode(regs))
-		return false;
-	if (get_user(insn, (u32 __user *)regs->epc))
+	if (user_mode(regs))
 		return false;
 
-	/* ESP32-S31 PIE and HWLoop are only implemented on hart 1.
-	 * On hart 0 the same opcodes trap as illegal instructions.
-	 * PIE uses a vendor pattern (low bits 0b11011), while HWLoop
-	 * uses opcode 0x2b (custom-1).  The previous check that also
-	 * matched every standard R-type (opcode 0x33) would migrate
-	 * any normal add/mul that spuriously faults, creating a storm
-	 * under SMP load that starves CFS and trips RCU stalls.
+	/*
+	 * With RVC, epc may be only 2-byte aligned and a 32-bit opcode may end
+	 * on the next page: read the low halfword, then the high one only for
+	 * a 32-bit opcode, and without faulting.
 	 */
-	if ((insn & 0x7fU) == 0x2bU)
-		return true;
-	if ((insn & 0x1bU) == 0x1bU)
-		return true;
+	lo = READ_ONCE(*(u16 *)regs->epc);
+	if ((lo & __INSN_LENGTH_MASK) != __INSN_LENGTH_32 ||
+	    get_kernel_nofault(hi, (u16 *)regs->epc + 1))
+		return false;
 
+	insn = lo | (u32)hi << 16;
+	if ((insn & 0xfffff07fU) != 0xf1402073U)
+		return false;
+
+	rd = (insn >> 7) & 0x1f;
+	if (rd)
+		((unsigned long *)regs)[rd] =
+			cpuid_to_hartid_map(raw_smp_processor_id());
+	regs->epc += sizeof(insn);
+	return true;
+}
+#else
+static __always_inline bool esp32s31_emulate_mhartid(struct pt_regs *regs)
+{
 	return false;
 }
+#endif
 
 asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)
 {
 	bool handled;
 
-#ifdef CONFIG_ESP32S31_RADIO_SMODE
-	/*
-	 * ESP-IDF's PM implementation has one otherwise harmless M-mode read of
-	 * mhartid in do_switch().  The radio objects now execute as part of the
-	 * S-mode kernel, where that CSR correctly traps.  Emulate the read from
-	 * Linux's logical-CPU-to-hart map instead of carrying a board-specific
-	 * binary patch in the closed object.  Match only CSRRS rd,mhartid,x0
-	 * (the canonical `csrr rd, mhartid` encoding), and never expose it to
-	 * userspace.
-	 */
-	if (!user_mode(regs)) {
-		u32 insn = READ_ONCE(*(u32 *)regs->epc);
-
-		if ((insn & 0xfffff07fU) == 0xf1402073U) {
-			unsigned int rd = (insn >> 7) & 0x1f;
-
-			if (rd)
-				((unsigned long *)regs)[rd] =
-					cpuid_to_hartid_map(raw_smp_processor_id());
-			regs->epc += sizeof(insn);
-			return;
-		}
-	}
-
-#endif
+	if (esp32s31_emulate_mhartid(regs))
+		return;
 
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
 		local_irq_enable();
 
 		handled = riscv_v_first_use_handler(regs);
-
-		if (!handled && esp32s31_hart0_pie_insn(regs)) {
-			cpumask_t pie_cpus;
-
-			cpumask_clear(&pie_cpus);
-			cpumask_set_cpu(1, &pie_cpus);
-			if (cpu_online(1)) {
-				set_cpus_allowed_ptr(current, &pie_cpus);
-				set_tsk_need_resched(current);
-				handled = true;
-			}
-		}
 		if (!handled)
 			do_trap_error(regs, SIGILL, ILL_ILLOPC, regs->epc,
 				      "Oops - illegal instruction");
