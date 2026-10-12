@@ -149,17 +149,20 @@ clear_core:
 
 static void esp32s31_radio_remove(struct platform_device *pdev)
 {
+	/*
+	 * As probe's unwind does: take the Wi-Fi frontend down while the
+	 * runtime still runs, so its stop command reaches the radio and no
+	 * .tx or NAPI poll is left when the runtime frees its rings.
+	 */
+	if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
+		s31_radio_wifi_frontend_exit();
 	if (s31_radio_started) {
-		if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
-			s31_radio_wifi_frontend_suspend();
 		if (s31_radio_configured_features & S31_RADIO_FEATURE_BLUETOOTH)
 			s31_radio_btdm_frontend_suspend();
 		s31_radio_runtime_shutdown();
 	}
 	if (s31_radio_configured_features & S31_RADIO_FEATURE_BLUETOOTH)
 		s31_radio_btdm_frontend_exit();
-	if (s31_radio_configured_features & S31_RADIO_FEATURE_WIFI)
-		s31_radio_wifi_frontend_exit();
 	device_remove_file(&pdev->dev, &dev_attr_radio_health);
 	s31_radio_started = false;
 	s31_radio_suspended = false;

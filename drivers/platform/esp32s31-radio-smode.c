@@ -2352,8 +2352,6 @@ static int s31_radio_wifi_enqueue(u8 interface, const u8 *frame, size_t length,
 	unsigned int next;
 	u8 kind;
 
-	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY || !s31_wifi_tx)
-		return -ENODEV;
 	if ((interface > S31_WIFI_IF_AP && interface != S31_WIFI_IF_SOFTMAC) ||
 	    !frame || length < (interface == S31_WIFI_IF_SOFTMAC ? 32 : ETH_HLEN) ||
 	    length > S31_WIFI_FRAME_SIZE)
@@ -2361,6 +2359,11 @@ static int s31_radio_wifi_enqueue(u8 interface, const u8 *frame, size_t length,
 	kind = interface == S31_WIFI_IF_SOFTMAC ? 0 :
 		s31_radio_tx_kind(frame, length);
 	spin_lock_irqsave(&s31_wifi_tx_lock, flags);
+	/* s31_radio_runtime_shutdown() clears s31_wifi_tx under this lock. */
+	if (atomic_read(&s31_radio_state) != ESP32S31_RADIO_READY || !s31_wifi_tx) {
+		spin_unlock_irqrestore(&s31_wifi_tx_lock, flags);
+		return -ENODEV;
+	}
 	next = (s31_wifi_tx_head + 1) % S31_WIFI_TX_SLOTS;
 	if (next == s31_wifi_tx_tail) {
 		spin_unlock_irqrestore(&s31_wifi_tx_lock, flags);
@@ -3210,10 +3213,19 @@ int s31_radio_runtime_shutdown(void)
 {
 #ifdef CONFIG_ESP32S31_RADIO_BLOBS
 	struct s31_radio_command shutdown;
+	struct s31_wifi_frame *wifi_tx;
 	struct task_struct *worker;
+	unsigned long flags;
 	int shutdown_ret = 0;
 	int i;
 
+	/*
+	 * Hold the control mutex until the control buffer is freed. A caller
+	 * that has it first finishes against the live runtime, later ones find
+	 * no buffer. Taken only around the free, it could wait forever for a
+	 * caller whose command was queued after s31_radio_fail_commands().
+	 */
+	mutex_lock(&s31_wifi_control_mutex);
 	if ((READ_ONCE(s31_radio_worker) || READ_ONCE(s31_radio_workerless)) &&
 	    atomic_read(&s31_radio_state) == ESP32S31_RADIO_READY) {
 		reinit_completion(&s31_shutdown_done);
@@ -3266,13 +3278,20 @@ int s31_radio_runtime_shutdown(void)
 	}
 	atomic_set(&s31_radio_pending_isrs, 0);
 
+	/* Wait for an enqueue that still saw READY; later ones fail. */
+	spin_lock_irqsave(&s31_wifi_tx_lock, flags);
+	wifi_tx = s31_wifi_tx;
+	s31_wifi_tx = NULL;
+	spin_unlock_irqrestore(&s31_wifi_tx_lock, flags);
+
 	s31_radio_sram_free(s31_radio_worker_stack);
 	s31_radio_sram_free(s31_wifi_disconnect_reason);
 	s31_radio_sram_free(s31_wifi_control_buffer);
 	s31_wifi_control_buffer = NULL;
+	mutex_unlock(&s31_wifi_control_mutex);
 	s31_radio_sram_free(s31_wifi_connect_params);
 	s31_radio_sram_free(s31_wifi_rx_data);
-	s31_radio_sram_free(s31_wifi_tx);
+	s31_radio_sram_free(wifi_tx);
 	s31_radio_sram_free(s31_wifi_rx);
 	s31_radio_sram_free(s31_hci_tx);
 	s31_radio_sram_free(s31_hci_rx);
@@ -3280,7 +3299,6 @@ int s31_radio_runtime_shutdown(void)
 	s31_wifi_disconnect_reason = NULL;
 	s31_wifi_connect_params = NULL;
 	s31_wifi_rx_data = NULL;
-	s31_wifi_tx = NULL;
 	s31_wifi_rx = NULL;
 	s31_hci_tx = NULL;
 	s31_hci_rx = NULL;
