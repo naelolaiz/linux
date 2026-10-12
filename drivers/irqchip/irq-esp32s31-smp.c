@@ -19,6 +19,7 @@
 
 #include <linux/cpu.h>
 #include <linux/cpuhotplug.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/irq.h>
@@ -41,6 +42,25 @@
 #define ESP32S31_TIMER_SOURCE(cpu)	(33U + (cpu))
 
 #define ESP32S31_NR_HARTS		2U
+
+/*
+ * Bus monitor (ESP-IDF's assist debug): it records each hart's PC and SP
+ * as it runs, readable from the other hart. A hart that takes no
+ * interrupts cannot print its own backtrace; esp32s31_report_harts()
+ * prints these instead.
+ */
+#define ESP32S31_BUSMON_BASE		0x2d002000U
+#define ESP32S31_BUSMON_SIZE		0x400U
+#define ESP32S31_BUSMON_RCD_EN(cpu)	(0x44U + (cpu) * 0x88U)
+#define ESP32S31_BUSMON_RCD_PC(cpu)	(0x48U + (cpu) * 0x88U)
+#define ESP32S31_BUSMON_RCD_SP(cpu)	(0x4cU + (cpu) * 0x88U)
+#define ESP32S31_BUSMON_LASTPC(cpu)	(0x60U + (cpu) * 0x88U)
+#define ESP32S31_BUSMON_RCD_ON		(BIT(0) | BIT(1))
+#define ESP32S31_BUSMON_DATE		0x3fcU
+/* HP_SYS_CLKRST BUSMON_CTRL0: clock enable and reset of both harts' monitors */
+#define ESP32S31_CLKRST_BUSMON		0x20587048U
+#define ESP32S31_CLKRST_BUSMON_CLK_EN	(BIT(0) | BIT(4))
+#define ESP32S31_CLKRST_BUSMON_RST_EN	(BIT(2) | BIT(6))
 
 static void __iomem *esp32s31_doorbells;
 
@@ -207,6 +227,108 @@ void esp32s31_local_timer_disable(unsigned int cpu)
 	esp_intmtx_unroute_local(cpu, ESP32S31_TIMER_SOURCE(cpu));
 }
 
+#ifdef CONFIG_ESP32S31_SMP_LOCKUP_REPORT
+/* How long a hart has to answer the backtrace IPI before it is reported. */
+#define ESP32S31_REPORT_WAIT_US		1000000U
+#define ESP32S31_REPORT_POLL_US		100U
+
+static void __iomem *esp32s31_busmon;
+
+static void __init esp32s31_busmon_init(void)
+{
+	void __iomem *clk = ioremap(ESP32S31_CLKRST_BUSMON, 4);
+	void __iomem *busmon;
+	unsigned int cpu;
+	u32 date;
+
+	if (!clk)
+		return;
+	/*
+	 * A bare read-modify-write inside the HP_SYS_CLKRST block, which the
+	 * clk and reset drivers reach through the sysctl syscon. It runs
+	 * from init_IRQ, before either driver probes, and neither uses
+	 * BUSMON_CTRL0.
+	 */
+	writel((readl(clk) | ESP32S31_CLKRST_BUSMON_CLK_EN) &
+	       ~ESP32S31_CLKRST_BUSMON_RST_EN, clk);
+	iounmap(clk);
+
+	busmon = ioremap(ESP32S31_BUSMON_BASE, ESP32S31_BUSMON_SIZE);
+	if (!busmon)
+		return;
+	/* A missing or gated block reads 0 or all-ones: no report then. */
+	date = readl(busmon + ESP32S31_BUSMON_DATE);
+	if (!date || date == U32_MAX) {
+		pr_warn("esp32s31-smp: no bus monitor (date %08x), no lockup report\n",
+			date);
+		iounmap(busmon);
+		return;
+	}
+	for (cpu = 0; cpu < ESP32S31_NR_HARTS; cpu++)
+		writel(ESP32S31_BUSMON_RCD_ON,
+		       busmon + ESP32S31_BUSMON_RCD_EN(cpu));
+	esp32s31_busmon = busmon;
+}
+
+/**
+ * esp32s31_report_harts - print where other harts are, from the bus monitor
+ * @mask: harts asked for a backtrace
+ *
+ * From the backtrace IPI sender: a hart stuck with interrupts off, or in
+ * the firmware, never answers that IPI. A hart that answers clears its
+ * bit in @mask and prints its own backtrace, so wait up to 1 s for that.
+ * For a hart that does not answer, print eight samples of its PC 50 us
+ * apart, its SP, the PC of its last exception, its doorbell and the CLIC
+ * pending/enable bytes of its IPI and timer. The doorbell and the IPI's
+ * pending byte are read after the backtrace IPI was rung, so a set value
+ * can be that IPI's own.
+ */
+void esp32s31_report_harts(const struct cpumask *mask)
+{
+	unsigned int cpu, i, t;
+	u8 ipi_ip, ipi_ie, tmr_ip, tmr_ie;
+	u32 pc[8];
+
+	if (!esp32s31_busmon)
+		return;
+
+	for_each_cpu(cpu, mask) {
+		if (cpu == raw_smp_processor_id() || cpu >= ESP32S31_NR_HARTS)
+			continue;
+
+		for (t = 0; t < ESP32S31_REPORT_WAIT_US &&
+			    cpumask_test_cpu(cpu, mask);
+		     t += ESP32S31_REPORT_POLL_US)
+			udelay(ESP32S31_REPORT_POLL_US);
+		if (!cpumask_test_cpu(cpu, mask))
+			continue;
+
+		for (i = 0; i < ARRAY_SIZE(pc); i++) {
+			pc[i] = readl(esp32s31_busmon +
+				      ESP32S31_BUSMON_RCD_PC(cpu));
+			udelay(50);
+		}
+		esp_clic_local_state(cpu, ESP32S31_CLIC_IPI_SLOT,
+				     &ipi_ip, &ipi_ie);
+		esp_clic_local_state(cpu, ESP32S31_CLIC_TIMER_SLOT,
+				     &tmr_ip, &tmr_ie);
+
+		pr_emerg("esp32s31-smp: hart %u sp %08x, last exception at %08x, doorbell %u after the IPI, CLIC %u ip/ie %u/%u, CLIC %u ip/ie %u/%u\n",
+			 cpu,
+			 readl(esp32s31_busmon + ESP32S31_BUSMON_RCD_SP(cpu)),
+			 readl(esp32s31_busmon + ESP32S31_BUSMON_LASTPC(cpu)),
+			 readl(esp32s31_doorbell(cpu)),
+			 ESP32S31_CLIC_IPI_SLOT, ipi_ip, ipi_ie,
+			 ESP32S31_CLIC_TIMER_SLOT, tmr_ip, tmr_ie);
+		for (i = 0; i < ARRAY_SIZE(pc); i++)
+			pr_emerg("esp32s31-smp: hart %u pc %08x %pS\n",
+				 cpu, pc[i], (void *)(uintptr_t)pc[i]);
+	}
+}
+#else
+static inline void esp32s31_busmon_init(void) { }
+#endif
+
 /* From the INTMTX init, once the CLIC and INTMTX drivers are up. */
 int __init esp32s31_smp_irq_init(void)
 {
@@ -251,6 +373,8 @@ int __init esp32s31_smp_irq_init(void)
 	 * SBI.
 	 */
 	riscv_ipi_set_virq_range(virq, BITS_PER_BYTE);
+
+	esp32s31_busmon_init();
 
 	pr_info("esp32s31-smp: cross-core IPI on CLIC %u, per-hart timer on CLIC %u\n",
 		ESP32S31_CLIC_IPI_SLOT, ESP32S31_CLIC_TIMER_SLOT);
