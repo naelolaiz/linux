@@ -76,9 +76,10 @@ static int sbi_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 	/* Make sure boot data is updated */
 	smp_mb();
 	hsm_data = __pa(bdata);
-	pr_info("S31 SMP: cpu%u start hart%lu boot_addr=%lx hsm_data=%lx sym_pa=%lx\n",
-		cpuid, hartid, boot_addr, hsm_data,
-		__pa_symbol(secondary_start_sbi));
+	/* ESP32-S31 bring-up: log the start and boot data addresses */
+	if (IS_ENABLED(CONFIG_ARCH_ESPRESSIF))
+		pr_info("CPU%u: starting hart %lu at %#lx, boot data at %#lx\n",
+			cpuid, hartid, boot_addr, hsm_data);
 	return sbi_hsm_hart_start(hartid, boot_addr, hsm_data);
 }
 

@@ -67,6 +67,52 @@
 				compatible = "riscv,cpu-intc";
 			};
 		};
+
+		/*
+		 * Same ISA as cpu@0: Linux only uses the extensions that
+		 * every hart lists.
+		 */
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			reg = <1>;
+			compatible = "riscv";
+			riscv,isa = "rv32imafc_zicsr_zifencei";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i", "m", "a", "f", "c", "zicsr",
+					       "zifencei";
+			riscv,cbom-block-size = <64>;
+			mmu-type = "riscv,sv32";
+			clock-frequency = <320000000>;
+
+			cpu1_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+
+				core1 {
+					cpu = <&cpu1>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The SBI timer counts CLINT MTIME, which stops while a hart is in
+	 * wfi: it cannot wake a hart, so Linux does not take it as the
+	 * broadcast timer.
+	 */
+	timer {
+		compatible = "riscv,timer";
+		interrupts-extended = <&cpu0_intc 5>, <&cpu1_intc 5>;
+		riscv,timer-cannot-wake-cpu;
 	};
 
 	memory@50000000 {
@@ -95,7 +141,8 @@
 
 		clic: interrupt-controller@10a00000 {
 			compatible = "esp,esp32s31-clic";
-			reg = <0x10a00000 0x2000>;
+			/* S-mode bank of the accessing hart, the other's at +0x10000 */
+			reg = <0x10a00000 0x20000>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupt-parent = <&cpu0_intc>;
@@ -103,7 +150,8 @@
 
 		intmtx: interrupt-controller@20585000 {
 			compatible = "esp,esp32s31-intmtx";
-			reg = <0x20585000 0x800>;
+			/* Core 0's routing table, core 1's at +0x800 */
+			reg = <0x20585000 0x1000>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupt-parent = <&clic>;

@@ -23,6 +23,10 @@ do {								\
 								\
 	__rwlock_init((lock), #lock, &__key);			\
 } while (0)
+#elif defined(arch_rwlock_init)
+/* The architecture initialises its lock word itself. */
+# define rwlock_init(lock)					\
+	do { arch_rwlock_init(&(lock)->raw_lock); } while (0)
 #else
 # define rwlock_init(lock)					\
 	do { *(lock) = __RW_LOCK_UNLOCKED(lock); } while (0)

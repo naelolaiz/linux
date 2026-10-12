@@ -24,50 +24,53 @@
 #define __atomic_release_fence()					\
 	__asm__ __volatile__(RISCV_RELEASE_BARRIER "" ::: "memory");
 
+#ifdef CONFIG_RISCV_AMO_SPINLOCKS
+/*
+ * Keep atomic_t on the AMO path of the other atomic operations, for the
+ * same reason as the lock word (asm/amo_spinlock.h): a plain load or store
+ * can miss what an AMO on the other hart did. The acquire and release
+ * forms are defined too, since their generic fallbacks are plain loads and
+ * stores that do not go through arch_atomic_read() and arch_atomic_set().
+ */
 static __always_inline int arch_atomic_read(const atomic_t *v)
 {
-#ifdef CONFIG_SOC_ESP32S31
 	atomic_t *rw = (atomic_t *)v;
-	int value;
+	int val;
 
 	__asm__ __volatile__("amoadd.w.aq %0, zero, %1"
-		: "=r" (value), "+A" (rw->counter)
+		: "=r" (val), "+A" (rw->counter)
 		:
 		: "memory");
-	return value;
-#else
-	return READ_ONCE(v->counter);
-#endif
+	return val;
 }
 static __always_inline void arch_atomic_set(atomic_t *v, int i)
 {
-#ifdef CONFIG_SOC_ESP32S31
 	int old;
 
 	__asm__ __volatile__("amoswap.w.aqrl %0, %2, %1"
 		: "=r" (old), "+A" (v->counter)
 		: "r" (i)
 		: "memory");
-#else
-	WRITE_ONCE(v->counter, i);
-#endif
 }
-
-#ifdef CONFIG_SOC_ESP32S31
-/* The generic native-word acquire/release fallback uses cached lw/sw and
- * bypasses arch_atomic_read/set.  Keep ordered accesses on the same AMO
- * path as the other atomic operations. */
 static __always_inline int arch_atomic_read_acquire(const atomic_t *v)
 {
 	return arch_atomic_read(v);
 }
 #define arch_atomic_read_acquire arch_atomic_read_acquire
-
 static __always_inline void arch_atomic_set_release(atomic_t *v, int i)
 {
 	arch_atomic_set(v, i);
 }
 #define arch_atomic_set_release arch_atomic_set_release
+#else
+static __always_inline int arch_atomic_read(const atomic_t *v)
+{
+	return READ_ONCE(v->counter);
+}
+static __always_inline void arch_atomic_set(atomic_t *v, int i)
+{
+	WRITE_ONCE(v->counter, i);
+}
 #endif
 
 #ifndef CONFIG_GENERIC_ATOMIC64

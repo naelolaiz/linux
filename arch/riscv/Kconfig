@@ -77,7 +77,7 @@ config RISCV
 	select ARCH_SUPPORTS_SCHED_MC if SMP
 	select ARCH_USE_CMPXCHG_LOCKREF if 64BIT
 	select ARCH_USE_MEMTEST
-	select ARCH_USE_QUEUED_RWLOCKS
+	select ARCH_USE_QUEUED_RWLOCKS if !RISCV_AMO_SPINLOCKS
 	select ARCH_USE_SYM_ANNOTATIONS
 	select ARCH_USES_CFI_TRAPS if CFI
 	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if MMU
@@ -295,6 +295,22 @@ config MMU
 	  Select if you want MMU-based virtualised addressing space
 	  support by paged memory management. If unsure, say 'Y'.
 
+config RISCV_NO_ASID
+	bool "Do not use address space IDs"
+	depends on MMU
+	default y if ARCH_ESPRESSIF && SMP
+	help
+	  Switch address spaces with a full local TLB flush, even when satp
+	  keeps ASID bits.
+
+	  The ESP32-S31 keeps 9 ASID bits in satp. With ASIDs, a program
+	  just started by exec on the second hart was seen fetching another
+	  process's instructions at the same address, which was put down to
+	  the TLB not telling translations apart by ASID. That cause is not
+	  confirmed.
+
+	  If unsure, say N.
+
 config KASAN_SHADOW_OFFSET
 	hex
 	depends on KASAN_GENERIC
@@ -309,20 +325,6 @@ config ARCH_SPARSEMEM_ENABLE
 	depends on MMU
 	select SPARSEMEM_STATIC if 32BIT && SPARSEMEM
 	select SPARSEMEM_VMEMMAP_ENABLE if 64BIT
-
-config RISCV_SPARSEMEM_SECTION_SIZE_BITS
-	int "32-bit SPARSEMEM section size (power of two)" if EXPERT
-	depends on 32BIT && SPARSEMEM
-	range 24 27
-	default 27
-	help
-	  Select the physical address bits covered by one SPARSEMEM section.
-	  Smaller sections reduce wasted struct page metadata on systems whose
-	  RAM bank is smaller than the RISC-V default 128 MiB section, at the
-	  cost of a slightly larger static mem_section table.
-
-	  A 16 MiB section (24 bits) is useful for small XIP systems because
-	  XIP requires SPARSEMEM but the flash mapping must not have a memmap.
 
 config ARCH_SELECT_MEMORY_MODEL
 	def_bool ARCH_SPARSEMEM_ENABLE
@@ -529,6 +531,7 @@ config NODES_SHIFT
 
 choice
 	prompt "RISC-V spinlock type"
+	default RISCV_AMO_SPINLOCKS if ARCH_ESPRESSIF && SMP
 	default RISCV_COMBO_SPINLOCKS
 
 config RISCV_TICKET_SPINLOCKS
@@ -557,6 +560,23 @@ config RISCV_COMBO_SPINLOCKS
 	help
 	  Embed both queued spinlock and ticket lock so that the spinlock
 	  implementation can be chosen at runtime.
+
+config RISCV_AMO_SPINLOCKS
+	bool "Using AMO-only test-and-set spinlock"
+	depends on SMP && (ARCH_ESPRESSIF || COMPILE_TEST)
+	help
+	  A test-and-set lock whose lock word is only read and written with
+	  32-bit AMOs; atomic_read() and atomic_set() use AMOs as well, and
+	  so does the reader-writer lock, in place of the queued rwlock.
+
+	  The ticket lock takes the lock with a 32-bit AMO and releases it
+	  with a 16-bit store, which needs the two to be safe against each
+	  other (asm-generic/ticket_spinlock.h). On the two harts of the
+	  ESP32-S31 both were seen spinning on a ticket lock that was free,
+	  which was put down to mixing AMOs with plain accesses. No
+	  documentation confirms this.
+
+	  The lock is not fair. Select this only for the ESP32-S31.
 
 endchoice
 
