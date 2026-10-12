@@ -896,6 +896,23 @@ config FPU
 
 	  If you don't know what to do here, say Y.
 
+config FPU_F_ONLY
+	bool "FPU support for harts with F but without D"
+	depends on FPU && 32BIT
+	default y if ARCH_ESPRESSIF
+	help
+	  Some RV32 cores, such as the Espressif ESP32-S31, implement the
+	  single-precision F extension without D. Without this option the
+	  kernel ignores F on such harts.
+
+	  With it, the kernel accepts F without D and saves and restores the
+	  floating point registers with single-precision loads and stores.
+	  The 64-bit register slots of the signal frame and ptrace layout stay
+	  as they are, with the value in the low 32 bits. D is ignored, so say
+	  Y only for systems whose harts have F and no D.
+
+	  If unsure, say N.
+
 config IRQ_STACKS
 	bool "Independent irq & softirq stacks" if EXPERT
 	default y
