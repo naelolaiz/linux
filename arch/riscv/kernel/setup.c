@@ -15,6 +15,7 @@
 #include <linux/memblock.h>
 #include <linux/sched.h>
 #include <linux/console.h>
+#include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/sched/task.h>
 #include <linux/smp.h>
@@ -363,6 +364,16 @@ void __init setup_arch(char **cmdline_p)
 
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
 	    riscv_isa_extension_available(NULL, ZICBOM))
+		riscv_noncoherent_supported();
+	/*
+	 * The ESP32-S31 has no Zicbom: its DMA cache maintenance goes through
+	 * the SBI, and drivers/cache/esp32s31_cache.c registers it only at
+	 * arch_initcall. Declare the non-coherent DMA here already, so that
+	 * dma_cache_alignment and the swiotlb bounce buffer for small
+	 * kmalloc() buffers are set up for it.
+	 */
+	if (IS_ENABLED(CONFIG_ESP32S31_CACHE) &&
+	    of_machine_is_compatible("esp,esp32s31"))
 		riscv_noncoherent_supported();
 	riscv_set_dma_cache_alignment();
 
