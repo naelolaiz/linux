@@ -145,7 +145,8 @@ static int riscv_ext_f_validate(const struct riscv_isa_ext_data *data,
 	 * Due to extension ordering, d is checked before f, so no deferral
 	 * is required.
 	 */
-	if (!__riscv_isa_extension_available(isa_bitmap, RISCV_ISA_EXT_d)) {
+	if (!IS_ENABLED(CONFIG_FPU_F_ONLY) &&
+	    !__riscv_isa_extension_available(isa_bitmap, RISCV_ISA_EXT_d)) {
 		pr_warn_once("This kernel does not support systems with F but not D\n");
 		return -EINVAL;
 	}
@@ -158,6 +159,12 @@ static int riscv_ext_d_validate(const struct riscv_isa_ext_data *data,
 {
 	if (!IS_ENABLED(CONFIG_FPU))
 		return -EINVAL;
+
+	/* The F-only context switch would lose the upper half of D registers. */
+	if (IS_ENABLED(CONFIG_FPU_F_ONLY)) {
+		pr_warn_once("D ignored: kernel built with CONFIG_FPU_F_ONLY\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -1077,10 +1084,11 @@ void __init riscv_fill_hwcap(void)
 	}
 
 	/*
-	 * We don't support systems with F but without D, so mask those out
-	 * here.
+	 * We don't support systems with F but without D, unless built with
+	 * CONFIG_FPU_F_ONLY, so mask those out here.
 	 */
-	if ((elf_hwcap & COMPAT_HWCAP_ISA_F) && !(elf_hwcap & COMPAT_HWCAP_ISA_D)) {
+	if (!IS_ENABLED(CONFIG_FPU_F_ONLY) &&
+	    (elf_hwcap & COMPAT_HWCAP_ISA_F) && !(elf_hwcap & COMPAT_HWCAP_ISA_D)) {
 		pr_info("This kernel does not support systems with F but not D\n");
 		elf_hwcap &= ~COMPAT_HWCAP_ISA_F;
 	}

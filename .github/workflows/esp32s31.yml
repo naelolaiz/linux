@@ -1,0 +1,328 @@
+# Builds this tree for the ESP32-S31: the XIP kernel and its device trees,
+# Espressif's boot stack (SPL, OpenSBI, U-Boot) at fixed commits and, when the
+# tree has the two-hart and radio support, the radio module and radio.bin
+# with GrieferPig's radio payload
+# (https://github.com/GrieferPig/esp32-s31-linux). Uploads one artifact per
+# job.
+
+name: ESP32-S31
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Espressif's boot stack with the second hart (SBI HSM, cpu@1 in U-Boot's
+  # DT). OpenSBI and U-Boot go together: U-Boot's DT caps OpenSBI's heap so
+  # that two harts' stacks still end below 0x2F030000.
+  ESPRESSIF_OPENSBI_REPO: https://github.com/espressif/opensbi
+  ESPRESSIF_OPENSBI_COMMIT: 5395e03e1cb295257142cfdeaade6334f1543bcb
+  ESPRESSIF_UBOOT_REPO: https://github.com/espressif/u-boot
+  ESPRESSIF_UBOOT_COMMIT: b2ec9ae21622f92d35462f5ae3bf053466998cc6
+  # Image tools (wraps the SPL for the mask ROM; flash layout).
+  ESPRESSIF_BSP_REPO: https://github.com/espressif/esp-linux-bsp
+  ESPRESSIF_BSP_COMMIT: 22455bf67ccc1aace91a547557af43fd85192281
+  # GrieferPig's build of the radio payload, and his kernel commit that
+  # holds the one header the payload includes.
+  GP_LINUX_COMMIT: 52dc6ea4935d13b0d0aaca32921f334f7d637738
+  GP_SUPERPROJECT_REPO: https://github.com/GrieferPig/esp32-s31-linux
+  GP_SUPERPROJECT_COMMIT: 1c132b4ad991960d10810d6138af317b01cf74c6
+  # GrieferPig's riscv32 musl GCC 15.2
+  # (https://github.com/GrieferPig/crosstool-NG-s31).
+  TOOLCHAIN_URL: https://github.com/GrieferPig/crosstool-NG-s31/releases/download/esp32s31-linux-gcc-15.2.0-5/riscv32-esp-linux-musl.tar.xz
+  TOOLCHAIN_PREFIX: riscv32-esp-linux-musl-
+
+jobs:
+  # Whether this tree has the radio driver, and with it the two-hart support.
+  tree:
+    runs-on: ubuntu-24.04
+    outputs:
+      radio: ${{ steps.look.outputs.radio }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          filter: blob:none
+          sparse-checkout: drivers/platform
+      - id: look
+        run: |
+          if [ -f drivers/platform/esp32s31-radio-module.c ]; then r=true; else r=false; fi
+          echo "radio=$r" | tee -a "$GITHUB_OUTPUT"
+
+  kernel:
+    needs: [tree, payload]
+    if: ${{ !cancelled() && needs.tree.result == 'success' && needs.payload.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RADIO: ${{ needs.tree.outputs.radio }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: linux
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev device-tree-compiler xz-utils
+
+      - name: Download the toolchain
+        run: |
+          mkdir -p toolchain
+          curl -fsSL "$TOOLCHAIN_URL" | tar -xJ -C toolchain
+          echo "$GITHUB_WORKSPACE/toolchain/bin" >> "$GITHUB_PATH"
+
+      # Block layer and USB storage always; the two harts, Wi-Fi and the
+      # lockup aids only for a tree with that support. An option that this
+      # tree does not define is reported and skipped; any other option that
+      # did not survive olddefconfig fails the job.
+      - name: Configure
+        working-directory: linux
+        run: |
+          frags=".github/esp32s31/10-block.config .github/esp32s31/20-usb-storage.config"
+          if [ "$RADIO" = true ]; then
+            frags="$frags .github/esp32s31/30-smp.config .github/esp32s31/40-wireless.config .github/esp32s31/50-debug.config"
+          fi
+          echo "fragments: $frags"
+          make O=../build ARCH=riscv CROSS_COMPILE="$TOOLCHAIN_PREFIX" esp32s31_minimal_defconfig
+          scripts/kconfig/merge_config.sh -m -O ../build ../build/.config $frags
+          make O=../build ARCH=riscv CROSS_COMPILE="$TOOLCHAIN_PREFIX" olddefconfig
+          fail=0
+          for f in $frags; do
+            for line in $(grep -E '^CONFIG_[A-Z0-9_]+=' "$f"); do
+              sym=${line%%=*}; sym=${sym#CONFIG_}
+              grep -qx "$line" ../build/.config && continue
+              if grep -rqE --include='Kconfig*' "^(menu)?config $sym\$" .; then
+                echo "not set: $line ($f)"; fail=1
+              else
+                echo "not in this tree: $line ($f)"
+              fi
+            done
+          done
+          exit $fail
+
+      - name: Build
+        working-directory: linux
+        run: |
+          targets="xipImage dtbs"
+          grep -qx 'CONFIG_MODULES=y' ../build/.config && targets="$targets modules"
+          make -j"$(nproc)" O=../build ARCH=riscv CROSS_COMPILE="$TOOLCHAIN_PREFIX" $targets
+
+      # The payload job of this run left it in the cache.
+      - name: Get the radio payload
+        if: env.RADIO == 'true'
+        uses: actions/cache/restore@v5
+        with:
+          path: payload
+          key: radio-payload-${{ env.GP_SUPERPROJECT_COMMIT }}-${{ env.GP_LINUX_COMMIT }}
+          fail-on-cache-miss: true
+
+      # The module's import table is GrieferPig's committed copy. It must
+      # list the same names as the payload built here. Line 2 only names the
+      # script that generated it, which has been renamed since.
+      - name: Check the radio imports
+        if: env.RADIO == 'true'
+        run: diff <(sed 2d payload/esp32s31-radio-imports.S) <(sed 2d linux/drivers/platform/esp32s31-radio-imports.S)
+
+      # GrieferPig's radio_image.py links the payload at the radio slot of
+      # his flash layout, 0xBE06E000 (raw flash 0x06E000). Espressif's SPL
+      # maps raw flash 0x100000 at 0x40000000, so the radio slot of this
+      # layout, raw flash 0x380000, is at 0xBE280000, where the radio driver
+      # expects it.
+      - name: Fetch GrieferPig's build
+        if: env.RADIO == 'true'
+        run: |
+          git init -q gp
+          git -C gp fetch -q --depth 1 "$GP_SUPERPROJECT_REPO" "$GP_SUPERPROJECT_COMMIT"
+          git -C gp checkout -q FETCH_HEAD
+          sed -i 's/^BASE = 0xBE06E000$/BASE = 0xBE280000/' gp/tools/build/radio_image.py
+          grep -x 'BASE = 0xBE280000' gp/tools/build/radio_image.py
+
+      # radio.bin holds the address of the radio's RAM arena in this vmlinux,
+      # so it goes to the board only together with this xipImage and module.
+      - name: Link radio.bin
+        if: env.RADIO == 'true'
+        run: |
+          python3 gp/tools/build/radio_image.py --prefix "$TOOLCHAIN_PREFIX" \
+            --kernel build/vmlinux --module build/drivers/platform/esp32s31-radio.ko \
+            --payload payload/linux_radio.localized.o \
+            --imports payload/linux-radio-linked-imports.txt --output radio/radio.bin
+
+      # esp32s31-maxcpus1.dtb starts Linux on hart 0 only and idles by
+      # polling: hart 1 is then started by hand.
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp build/arch/riscv/boot/xipImage build/.config build/System.map out/
+          cp build/arch/riscv/boot/dts/espressif/*.dtb out/
+          sums="xipImage *.dtb"
+          if [ "$RADIO" = true ]; then
+            cp build/drivers/platform/esp32s31-radio.ko radio/radio.bin radio/radio.json out/
+            cp out/esp32s31.dtb out/esp32s31-maxcpus1.dtb
+            fdtput -t s out/esp32s31-maxcpus1.dtb /chosen bootargs \
+              "$(fdtget out/esp32s31.dtb /chosen bootargs) maxcpus=1 nohlt"
+            fdtget out/esp32s31-maxcpus1.dtb /chosen bootargs
+            sums="$sums radio.bin esp32s31-radio.ko"
+          fi
+          echo "$GITHUB_REPOSITORY $GITHUB_REF_NAME $GITHUB_SHA" > out/BUILD-INFO.txt
+          echo "kernel release $(make -s -C linux O=../build ARCH=riscv CROSS_COMPILE="$TOOLCHAIN_PREFIX" kernelrelease)" >> out/BUILD-INFO.txt
+          if [ "$RADIO" = true ]; then cat payload/BUILD-INFO.txt >> out/BUILD-INFO.txt; fi
+          (cd out && sha256sum $sums > SHA256SUMS)
+          cat out/BUILD-INFO.txt
+          ls -l out
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: kernel
+          path: out/
+          retention-days: 30
+
+  boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # swig and python3-dev: U-Boot's binman needs pylibfdt.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev device-tree-compiler swig python3-dev python3-setuptools xz-utils
+          python3 -m venv esptool-venv
+          esptool-venv/bin/pip install -q esptool==5.5.0
+
+      - name: Download the toolchain
+        run: |
+          mkdir -p toolchain
+          curl -fsSL "$TOOLCHAIN_URL" | tar -xJ -C toolchain
+          echo "$GITHUB_WORKSPACE/toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the sources
+        run: |
+          for t in opensbi:$ESPRESSIF_OPENSBI_REPO:$ESPRESSIF_OPENSBI_COMMIT \
+                   u-boot:$ESPRESSIF_UBOOT_REPO:$ESPRESSIF_UBOOT_COMMIT \
+                   bsp:$ESPRESSIF_BSP_REPO:$ESPRESSIF_BSP_COMMIT; do
+            dir=${t%%:*}; rest=${t#*:}; commit=${rest##*:}; repo=${rest%:*}
+            git init -q "$dir"
+            git -C "$dir" fetch -q --depth 1 "$repo" "$commit"
+            git -C "$dir" checkout -q FETCH_HEAD
+          done
+
+      - name: Build OpenSBI
+        run: |
+          make -C opensbi -j"$(nproc)" CROSS_COMPILE="$TOOLCHAIN_PREFIX" \
+            PLATFORM=generic PLATFORM_DEFCONFIG=esp32s31_defconfig PLATFORM_RISCV_XLEN=32
+          "${TOOLCHAIN_PREFIX}readelf" -lW opensbi/build/platform/generic/firmware/fw_dynamic.elf | grep LOAD
+
+      # U-Boot's binman packs OpenSBI, U-Boot and its DT into u-boot.itb.
+      - name: Build U-Boot
+        run: |
+          make -C u-boot CROSS_COMPILE="$TOOLCHAIN_PREFIX" espressif_esp32s31_defconfig
+          make -C u-boot -j"$(nproc)" CROSS_COMPILE="$TOOLCHAIN_PREFIX" \
+            OPENSBI="$GITHUB_WORKSPACE/opensbi/build/platform/generic/firmware/fw_dynamic.bin"
+
+      # Espressif's wrapper calls Buildroot's objcopy; point that name at
+      # this toolchain's.
+      - name: Wrap the SPL for the mask ROM
+        run: |
+          mkdir -p shim out
+          ln -s "$GITHUB_WORKSPACE/toolchain/bin/${TOOLCHAIN_PREFIX}objcopy" shim/riscv32-buildroot-linux-musl-objcopy
+          PATH="$GITHUB_WORKSPACE/shim:$GITHUB_WORKSPACE/esptool-venv/bin:$PATH" \
+            bash bsp/tools/gen_spl_img_esp32s31.sh -i u-boot/spl/u-boot-spl-dtb.bin -O out/spl_app.bin
+
+      - name: Collect
+        run: |
+          cp u-boot/u-boot.itb opensbi/build/platform/generic/firmware/fw_dynamic.elf out/
+          echo "espressif/opensbi $ESPRESSIF_OPENSBI_COMMIT" > out/BUILD-INFO.txt
+          echo "espressif/u-boot $ESPRESSIF_UBOOT_COMMIT" >> out/BUILD-INFO.txt
+          echo "espressif/esp-linux-bsp $ESPRESSIF_BSP_COMMIT" >> out/BUILD-INFO.txt
+          (cd out && sha256sum spl_app.bin u-boot.itb > SHA256SUMS)
+          ls -l out
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: boot
+          path: out/
+          retention-days: 30
+
+  # GrieferPig's radio payload: Espressif's closed Wi-Fi and Bluetooth
+  # libraries and his FreeRTOS shim, linked relocatable with ESP-IDF's
+  # compiler. It depends on his build and ESP-IDF only, not on this tree,
+  # so it is cached by his commits and built once.
+  payload:
+    needs: tree
+    if: needs.tree.outputs.radio == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      IDF_PATH: ${{ github.workspace }}/esp-idf
+    steps:
+      - name: Look for the payload in the cache
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: payload
+          key: radio-payload-${{ env.GP_SUPERPROJECT_COMMIT }}-${{ env.GP_LINUX_COMMIT }}
+
+      # radio_stack.c includes include/linux/esp32s31-radio-control.h from
+      # his kernel tree by relative path; that one file is enough.
+      - name: Fetch GrieferPig's build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q gp
+          git -C gp fetch -q --depth 1 "$GP_SUPERPROJECT_REPO" "$GP_SUPERPROJECT_COMMIT"
+          git -C gp checkout -q FETCH_HEAD
+          mkdir -p gp/linux-esp32-s31/include/linux
+          curl -fsSL -o gp/linux-esp32-s31/include/linux/esp32s31-radio-control.h \
+            "https://raw.githubusercontent.com/GrieferPig/linux-esp32-s31/$GP_LINUX_COMMIT/include/linux/esp32s31-radio-control.h"
+          # ESP_IDF_REF and ESP_ELF_RELEASE
+          sed -nE 's/^([A-Z_]+) *[:?]?= *(.*)$/\1=\2/p' gp/configs/build-versions.mk | tee -a "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex gperf ccache cmake ninja-build libffi-dev libssl-dev libusb-1.0-0 python3-venv python3-pyelftools
+
+      - name: Install ESP-IDF
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --filter=blob:none https://github.com/espressif/esp-idf.git "$IDF_PATH"
+          git -C "$IDF_PATH" checkout -q "$ESP_IDF_REF"
+          git -C "$IDF_PATH" submodule update -q --init --recursive
+          "$IDF_PATH/install.sh" esp32s31
+
+      # CROSS_COMPILE only names the nm of his last step, which writes a
+      # symbol list for his own kernel build; ESP-IDF's nm does that.
+      - name: Build the payload
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: gp
+        run: |
+          source "$IDF_PATH/export.sh"
+          make IDF_EXPORT="$IDF_PATH/export.sh" CROSS_COMPILE=riscv32-esp-elf- radio-linux-payload
+          mkdir -p ../payload
+          cp out/radio/linux_radio.localized.o out/radio/linux-radio-linked-imports.txt out/generated/esp32s31-radio-imports.S ../payload/
+          {
+            echo "GrieferPig/esp32-s31-linux $GP_SUPERPROJECT_COMMIT"
+            echo "GrieferPig/linux-esp32-s31 $GP_LINUX_COMMIT (esp32s31-radio-control.h)"
+            echo "espressif/esp-idf $ESP_IDF_REF"
+          } > ../payload/BUILD-INFO.txt
+          (cd ../payload && sha256sum linux_radio.localized.o linux-radio-linked-imports.txt esp32s31-radio-imports.S > SHA256SUMS)
+
+      # imports.S is text and must match the radio driver's copy; the log
+      # shows it in full.
+      - name: Show the payload
+        run: |
+          ls -l payload
+          cat payload/BUILD-INFO.txt payload/SHA256SUMS
+          echo "=== esp32s31-radio-imports.S"
+          cat payload/esp32s31-radio-imports.S
+          echo "=== end"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: radio-payload
+          path: payload/
+          retention-days: 30
