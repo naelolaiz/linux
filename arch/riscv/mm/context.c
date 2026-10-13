@@ -201,7 +201,11 @@ static void set_mm_noasid(struct mm_struct *mm)
 {
 	/* Switch the page table and blindly nuke entire local TLB */
 	csr_write(CSR_SATP, virt_to_pfn(mm->pgd) | satp_mode);
-	local_flush_tlb_all_asid(0);
+	/* Without ASIDs in the TLB, sfence.vma with ASID 0 may keep some. */
+	if (IS_ENABLED(CONFIG_RISCV_NO_ASID))
+		local_flush_tlb_all();
+	else
+		local_flush_tlb_all_asid(0);
 }
 
 static inline void set_mm(struct mm_struct *prev,
@@ -242,6 +246,11 @@ static int __init asids_init(void)
 	 * to remove unwanted TLB enteries.
 	 */
 	local_flush_tlb_all();
+
+	if (IS_ENABLED(CONFIG_RISCV_NO_ASID)) {
+		pr_info("ASID allocator disabled (CONFIG_RISCV_NO_ASID)\n");
+		return 0;
+	}
 
 	/* Pre-compute ASID details */
 	if (asid_bits) {

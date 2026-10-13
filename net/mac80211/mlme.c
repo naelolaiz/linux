@@ -360,6 +360,19 @@ ieee80211_verify_sta_ht_mcs_support(struct ieee80211_sub_if_data *sdata,
 	if (!ht_op)
 		return false;
 
+	/*
+	 * MCS 77 to 127 are reserved.  Some APs fill the whole Basic HT-MCS
+	 * Set with ones as a placeholder; a set with a reserved bit is
+	 * malformed, so ignore it instead of disabling HT.
+	 */
+	if (ht_op->basic_set[IEEE80211_HT_MCS_MASK_LEN - 1] & 0xe0 ||
+	    memchr_inv(&ht_op->basic_set[IEEE80211_HT_MCS_MASK_LEN], 0,
+		       sizeof(ht_op->basic_set) - IEEE80211_HT_MCS_MASK_LEN)) {
+		sdata_dbg(sdata,
+			  "ignoring Basic HT-MCS set with reserved bits\n");
+		return true;
+	}
+
 	memcpy(&sta_ht_cap, &sband->ht_cap, sizeof(sta_ht_cap));
 	ieee80211_apply_htcap_overrides(sdata, &sta_ht_cap);
 

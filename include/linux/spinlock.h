@@ -108,6 +108,10 @@ do {									\
 	__raw_spin_lock_init((lock), #lock, &__key, LD_WAIT_SPIN);	\
 } while (0)
 
+#elif defined(arch_spin_lock_init)
+/* The architecture initialises its lock word itself. */
+# define raw_spin_lock_init(lock)				\
+	do { arch_spin_lock_init(&(lock)->raw_lock); } while (0)
 #else
 # define raw_spin_lock_init(lock)				\
 	do { *(lock) = __RAW_SPIN_LOCK_UNLOCKED(lock); } while (0)
@@ -335,6 +339,11 @@ do {								\
 	__raw_spin_lock_init(spinlock_check(lock),		\
 			     #lock, &__key, LD_WAIT_CONFIG);	\
 } while (0)
+
+#elif defined(arch_spin_lock_init)
+
+# define spin_lock_init(_lock)			\
+	raw_spin_lock_init(spinlock_check(_lock))
 
 #else
 

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config WLAN_VENDOR_ESPRESSIF
+	bool "Espressif wireless devices"
+	default y
+
+if WLAN_VENDOR_ESPRESSIF
+
+config ESP32S31_WIFI
+	bool
+	default y if ESP32S31_RADIO_SMODE_DRIVER
+
+endif

@@ -18,11 +18,14 @@
 #include <linux/uaccess.h>
 #include <linux/personality.h>
 #include <linux/entry-common.h>
+#include <linux/irqchip/irq-esp32s31.h>
+#include <linux/percpu.h>
 
 #include <asm/asm-prototypes.h>
 #include <asm/unistd.h>
 #include <asm/processor.h>
 #include <asm/csr.h>
+#include <asm/esp-clic.h>
 #include <asm/stacktrace.h>
 #include <asm/string.h>
 #include <asm/switch_to.h>
@@ -45,6 +48,26 @@ void noinstr arch_cpu_idle(void)
 {
 	cpu_do_idle();
 }
+
+#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
+/* A hart that idles with the CLIC level raised takes no interrupt. */
+void arch_cpu_idle_enter(void)
+{
+	lockdep_assert_irqs_disabled();
+	esp_clic_drop_level();
+}
+#endif
+
+#ifdef CONFIG_ESP32S31_SMP
+void arch_cpu_idle_poll(void)
+{
+	static DEFINE_PER_CPU(unsigned int, polls);
+
+	/* A pending interrupt is normally taken at once; sample now and then. */
+	if (!(this_cpu_inc_return(polls) & 63))
+		esp32s31_irq_poll();
+}
+#endif
 
 int set_unalign_ctl(struct task_struct *tsk, unsigned int val)
 {

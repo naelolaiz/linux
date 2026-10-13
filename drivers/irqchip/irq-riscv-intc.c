@@ -25,6 +25,13 @@ static struct irq_domain *intc_domain;
 static unsigned int riscv_intc_nr_irqs __ro_after_init = BITS_PER_LONG;
 static unsigned int riscv_intc_custom_base __ro_after_init = BITS_PER_LONG;
 static unsigned int riscv_intc_custom_nr_irqs __ro_after_init;
+/*
+ * ESP32-S31: local interrupts 16-47 come from the CLIC, whose enables are
+ * the memory-mapped clicintie bytes that the esp-clic driver programs.
+ * sie is only emulated by the SBI and sieh (IDs 32-47) is not, so the
+ * mask and unmask below touch neither.
+ */
+static bool riscv_intc_esp_clic __ro_after_init;
 
 static void riscv_intc_irq(struct pt_regs *regs)
 {
@@ -51,6 +58,9 @@ static void riscv_intc_aia_irq(struct pt_regs *regs)
 
 static void riscv_intc_irq_mask(struct irq_data *d)
 {
+	if (riscv_intc_esp_clic)
+		return;
+
 	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)
 		csr_clear(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));
 	else
@@ -59,6 +69,9 @@ static void riscv_intc_irq_mask(struct irq_data *d)
 
 static void riscv_intc_irq_unmask(struct irq_data *d)
 {
+	if (riscv_intc_esp_clic)
+		return;
+
 	if (IS_ENABLED(CONFIG_32BIT) && d->hwirq >= BITS_PER_LONG)
 		csr_set(CSR_IEH, BIT(d->hwirq - BITS_PER_LONG));
 	else
@@ -241,6 +254,23 @@ static int __init riscv_intc_init(struct device_node *node,
 		riscv_intc_custom_base = ANDES_SLI_CAUSE_BASE;
 		riscv_intc_custom_nr_irqs = ANDES_RV_IRQ_LAST;
 		chip = &andes_intc_chip;
+	}
+
+	/*
+	 * riscv_intc_nr_irqs = 48 only bounds the fwspec allocations of
+	 * riscv_intc_domain_alloc(); the CLIC drivers map their slots through
+	 * .map. With mask and unmask no-ops here, a per-hart CLIC slot is
+	 * enabled and disabled only by esp_clic_configure_local().
+	 */
+	if (IS_ENABLED(CONFIG_ESP_CLIC)) {
+		struct device_node *clic;
+
+		clic = of_find_compatible_node(NULL, NULL, "esp,esp32s31-clic");
+		if (clic) {
+			riscv_intc_esp_clic = true;
+			riscv_intc_nr_irqs = 48;
+			of_node_put(clic);
+		}
 	}
 
 	return riscv_intc_init_common(of_fwnode_handle(node), chip);

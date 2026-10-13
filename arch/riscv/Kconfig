@@ -77,7 +77,7 @@ config RISCV
 	select ARCH_SUPPORTS_SCHED_MC if SMP
 	select ARCH_USE_CMPXCHG_LOCKREF if 64BIT
 	select ARCH_USE_MEMTEST
-	select ARCH_USE_QUEUED_RWLOCKS
+	select ARCH_USE_QUEUED_RWLOCKS if !RISCV_AMO_SPINLOCKS
 	select ARCH_USE_SYM_ANNOTATIONS
 	select ARCH_USES_CFI_TRAPS if CFI
 	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if MMU
@@ -295,6 +295,22 @@ config MMU
 	  Select if you want MMU-based virtualised addressing space
 	  support by paged memory management. If unsure, say 'Y'.
 
+config RISCV_NO_ASID
+	bool "Do not use address space IDs"
+	depends on MMU
+	default y if ARCH_ESPRESSIF && SMP
+	help
+	  Switch address spaces with a full local TLB flush, even when satp
+	  keeps ASID bits.
+
+	  The ESP32-S31 keeps 9 ASID bits in satp. With ASIDs, a program
+	  just started by exec on the second hart was seen fetching another
+	  process's instructions at the same address, which was put down to
+	  the TLB not telling translations apart by ASID. That cause is not
+	  confirmed.
+
+	  If unsure, say N.
+
 config KASAN_SHADOW_OFFSET
 	hex
 	depends on KASAN_GENERIC
@@ -369,11 +385,16 @@ config RISCV_NONSTANDARD_CACHE_OPS
 config RISCV_ESP_CLIC_TRAP_QUIRK
 	bool
 	help
-	  CLIC-mode trap-handling quirks in entry.S for the Espressif
-	  ESP32-S31: 64-byte alignment of the trap vector (stvec.base[5:0]
-	  are hardware-forced to 0 in CLIC mode) and masking of the CLIC
-	  extension bits in scause. Selected by ESP_CLIC; no effect on other
-	  platforms.
+	  CLIC-mode trap handling for the Espressif ESP32-S31: in entry.S,
+	  64-byte alignment of the trap vector (stvec.base[5:0] are
+	  hardware-forced to 0 in CLIC mode) and masking of the CLIC
+	  extension bits in scause; and lowering of the CLIC's S-mode
+	  interrupt level (asm/esp-clic.h) after every interrupt (traps.c),
+	  on idle entry (process.c), after every SBI call (sbi_ecall.c) and
+	  in the ESP32-S31 idle poll. Selected by ESP_CLIC. The code runs on
+	  every hart, whatever the DT describes; on other RISC-V harts it
+	  does nothing useful and adds work to every trap, interrupt, idle
+	  entry and SBI call.
 
 config AS_HAS_INSN
 	def_bool $(as-instr,.insn 0x100000f)
@@ -515,6 +536,7 @@ config NODES_SHIFT
 
 choice
 	prompt "RISC-V spinlock type"
+	default RISCV_AMO_SPINLOCKS if ARCH_ESPRESSIF && SMP
 	default RISCV_COMBO_SPINLOCKS
 
 config RISCV_TICKET_SPINLOCKS
@@ -543,6 +565,23 @@ config RISCV_COMBO_SPINLOCKS
 	help
 	  Embed both queued spinlock and ticket lock so that the spinlock
 	  implementation can be chosen at runtime.
+
+config RISCV_AMO_SPINLOCKS
+	bool "Using AMO-only test-and-set spinlock"
+	depends on SMP && (ARCH_ESPRESSIF || COMPILE_TEST)
+	help
+	  A test-and-set lock whose lock word is only read and written with
+	  32-bit AMOs; atomic_read() and atomic_set() use AMOs as well, and
+	  so does the reader-writer lock, in place of the queued rwlock.
+
+	  The ticket lock takes the lock with a 32-bit AMO and releases it
+	  with a 16-bit store, which needs the two to be safe against each
+	  other (asm-generic/ticket_spinlock.h). On the two harts of the
+	  ESP32-S31 both were seen spinning on a ticket lock that was free,
+	  which was put down to mixing AMOs with plain accesses. No
+	  documentation confirms this.
+
+	  The lock is not fair. Select this only for the ESP32-S31.
 
 endchoice
 
@@ -895,6 +934,23 @@ config FPU
 	  may use the floating point unit.
 
 	  If you don't know what to do here, say Y.
+
+config FPU_F_ONLY
+	bool "FPU support for harts with F but without D"
+	depends on FPU && 32BIT
+	default y if ARCH_ESPRESSIF
+	help
+	  Some RV32 cores, such as the Espressif ESP32-S31, implement the
+	  single-precision F extension without D. Without this option the
+	  kernel ignores F on such harts.
+
+	  With it, the kernel accepts F without D and saves and restores the
+	  floating point registers with single-precision loads and stores.
+	  The 64-bit register slots of the signal frame and ptrace layout stay
+	  as they are, with the value in the low 32 bits. D is ignored, so say
+	  Y only for systems whose harts have F and no D.
+
+	  If unsure, say N.
 
 config IRQ_STACKS
 	bool "Independent irq & softirq stacks" if EXPERT

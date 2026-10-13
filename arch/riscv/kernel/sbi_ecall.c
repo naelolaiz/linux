@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2024 Rivos Inc. */
 
+#include <linux/irqflags.h>
+#include <asm/esp-clic.h>
 #include <asm/sbi.h>
 #define CREATE_TRACE_POINTS
 #include <asm/trace.h>
@@ -34,10 +36,24 @@ struct sbiret __sbi_ecall(unsigned long arg0, unsigned long arg1,
 	register uintptr_t a5 asm ("a5") = (uintptr_t)(arg5);
 	register uintptr_t a6 asm ("a6") = (uintptr_t)(fid);
 	register uintptr_t a7 asm ("a7") = (uintptr_t)(ext);
+#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
+	/*
+	 * Lower the CLIC level after the call, as GrieferPig does
+	 * (linux-esp32-s31 bd15992071dc). Whether the mret that ends the
+	 * call leaves the level raised is unverified.
+	 */
+	unsigned long flags;
+
+	raw_local_irq_save(flags);
+#endif
 	asm volatile ("ecall"
 		       : "+r" (a0), "+r" (a1)
 		       : "r" (a2), "r" (a3), "r" (a4), "r" (a5), "r" (a6), "r" (a7)
 		       : "memory");
+#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
+	esp_clic_drop_level();
+	raw_local_irq_restore(flags);
+#endif
 	ret.error = a0;
 	ret.value = a1;
 

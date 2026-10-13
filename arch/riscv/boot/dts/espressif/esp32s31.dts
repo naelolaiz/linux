@@ -41,7 +41,7 @@
 
 	chosen {
 		bootargs =
-		"earlycon=sbi console=ttyS0 root=mtd:rootfs rootfstype=cramfs ro swiotlb=128";
+		"earlycon=sbi console=ttyS0 root=mtd:rootfs rootfstype=cramfs ro swiotlb=128,1";
 	};
 
 	cpus {
@@ -53,10 +53,11 @@
 			device_type = "cpu";
 			reg = <0>;
 			compatible = "riscv";
-			riscv,isa = "rv32imac_zicsr_zifencei";
+			riscv,isa = "rv32imafc_zicsr_zifencei";
 			riscv,isa-base = "rv32i";
-			riscv,isa-extensions = "i", "m", "a", "c", "zicsr",
+			riscv,isa-extensions = "i", "m", "a", "f", "c", "zicsr",
 					       "zifencei";
+			riscv,cbom-block-size = <64>;
 			mmu-type = "riscv,sv32";
 			clock-frequency = <320000000>;
 
@@ -66,6 +67,52 @@
 				compatible = "riscv,cpu-intc";
 			};
 		};
+
+		/*
+		 * Same ISA as cpu@0: Linux only uses the extensions that
+		 * every hart lists.
+		 */
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			reg = <1>;
+			compatible = "riscv";
+			riscv,isa = "rv32imafc_zicsr_zifencei";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i", "m", "a", "f", "c", "zicsr",
+					       "zifencei";
+			riscv,cbom-block-size = <64>;
+			mmu-type = "riscv,sv32";
+			clock-frequency = <320000000>;
+
+			cpu1_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu0>;
+				};
+
+				core1 {
+					cpu = <&cpu1>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * The SBI timer counts CLINT MTIME, which stops while a hart is in
+	 * wfi: it cannot wake a hart, so Linux does not take it as the
+	 * broadcast timer.
+	 */
+	timer {
+		compatible = "riscv,timer";
+		interrupts-extended = <&cpu0_intc 5>, <&cpu1_intc 5>;
+		riscv,timer-cannot-wake-cpu;
 	};
 
 	memory@50000000 {
@@ -78,11 +125,17 @@
 		#size-cells = <1>;
 		ranges;
 
-		dma_pool: dma-pool@2f030000 {
+		/*
+		 * Coherent DMA memory for the EMAC rings and the USB host. It stays
+		 * in internal SRAM, which the data cache does not cover, and is kept
+		 * small so that 0x2f030000-0x2f072380 and 0x2f078c00-0x2f07cfb0 stay
+		 * free for the Wi-Fi radio code.
+		 */
+		dma_pool: dma-pool@2f073000 {
 			compatible = "shared-dma-pool";
 			linux,dma-default;
 			no-map;
-			reg = <0x2f030000 0x40000>;
+			reg = <0x2f073000 0x5000>;
 		};
 	};
 
@@ -94,7 +147,8 @@
 
 		clic: interrupt-controller@10a00000 {
 			compatible = "esp,esp32s31-clic";
-			reg = <0x10a00000 0x2000>;
+			/* S-mode bank of the accessing hart, the other's at +0x10000 */
+			reg = <0x10a00000 0x20000>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupt-parent = <&cpu0_intc>;
@@ -102,7 +156,8 @@
 
 		intmtx: interrupt-controller@20585000 {
 			compatible = "esp,esp32s31-intmtx";
-			reg = <0x20585000 0x800>;
+			/* Core 0's routing table, core 1's at +0x800 */
+			reg = <0x20585000 0x1000>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupt-parent = <&clic>;
@@ -366,6 +421,28 @@
 			linux,mtd-name = "rootfs";
 			#address-cells = <1>;
 			#size-cells = <1>;
+		};
+	};
+
+	/*
+	 * Wi-Fi radio run by esp32s31-radio.ko. The ESP-IDF radio
+	 * libraries execute in place from the radio's flash slot
+	 * (drivers/platform/esp32s31-radio-xip.h) and use HP SRAM
+	 * (S31_RADIO_HEAP* in drivers/platform/esp32s31-radio-smode.c)
+	 * directly through the kernel's identity maps
+	 * (ESP32S31_RADIO_SMODE), not through DT resources. Interrupts
+	 * are allocated at run time from &intmtx by ESP-IDF source number.
+	 */
+	radio: radio {
+		compatible = "esp,esp32s31-radio";
+
+		wifi {
+			compatible = "esp,esp32s31-wifi";
+		};
+
+		bluetooth {
+			compatible = "esp,esp32s31-btdm";
+			status = "disabled";
 		};
 	};
 };

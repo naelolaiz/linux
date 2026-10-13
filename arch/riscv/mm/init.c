@@ -24,6 +24,7 @@
 #include <linux/execmem.h>
 
 #include <asm/alternative.h>
+#include <asm/esp32s31-radio-map.h>
 #include <asm/fixmap.h>
 #include <asm/io.h>
 #include <asm/kasan.h>
@@ -776,11 +777,21 @@ asmlinkage void __init __copy_data(void)
 	void *to = (void *)CONFIG_PHYS_RAM_BASE;
 	size_t data_sz = (size_t)((uintptr_t)(&__bss_start) -
 				   (uintptr_t)(&_sdata));
-	size_t bss_sz = (size_t)((uintptr_t)(&_end) -
+	size_t bss_sz = (size_t)((uintptr_t)(&__bss_stop) -
 				  (uintptr_t)(&__bss_start));
+	size_t percpu_off = (size_t)((uintptr_t)(&__per_cpu_start) -
+				     (uintptr_t)(&_sdata));
+	size_t percpu_sz = (size_t)((uintptr_t)(&__per_cpu_end) -
+				    (uintptr_t)(&__per_cpu_start));
 
 	memcpy(to, from, data_sz);
 	memset(to + data_sz, 0, bss_sz);
+	/*
+	 * vmlinux-xip.lds.S places the per-CPU section after BSS. With
+	 * CONFIG_SMP it holds the initial values of every per-CPU variable,
+	 * which setup_per_cpu_areas() copies from here: copy, do not clear.
+	 */
+	memcpy(to + percpu_off, from + percpu_off, percpu_sz);
 }
 #endif
 
@@ -1386,6 +1397,29 @@ static void __init setup_vm_final(void)
 	if (IS_ENABLED(CONFIG_64BIT) ||
 	    IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
+
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+	/*
+	 * ESP-IDF's closed radio libraries contain absolute references to the
+	 * modem/peripheral windows, internal SRAM and mask ROM.  Map them one
+	 * to one in init_mm; the radio kthreads borrow init_mm to run the
+	 * libraries.  sync_kernel_mappings() also copies the cache, SRAM and
+	 * ROM entries into every process page table, below TASK_SIZE.
+	 */
+	for (uintptr_t va = ESP32S31_MODEM_WINDOW;
+	     va < ESP32S31_MODEM_WINDOW + ESP32S31_MODEM_WINDOW_SIZE;
+	     va += PGDIR_SIZE)
+		create_pgd_mapping(swapper_pg_dir, va, va,
+				   PGDIR_SIZE, PAGE_KERNEL_IO);
+	/* IDF cache maintenance uses absolute CACHE register addresses. */
+	create_pgd_mapping(swapper_pg_dir, ESP32S31_CACHE_WINDOW,
+			   ESP32S31_CACHE_WINDOW, PGDIR_SIZE, PAGE_KERNEL_IO);
+	create_pgd_mapping(swapper_pg_dir, ESP32S31_SRAM_WINDOW,
+			   ESP32S31_SRAM_WINDOW, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+	create_pgd_mapping(swapper_pg_dir, ESP32S31_ROM_WINDOW,
+			   ESP32S31_ROM_WINDOW, PGDIR_SIZE,
+			   PAGE_KERNEL_READ_EXEC);
+#endif
 
 #ifdef CONFIG_KASAN
 	kasan_swapper_init();

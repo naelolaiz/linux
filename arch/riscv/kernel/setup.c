@@ -15,6 +15,7 @@
 #include <linux/memblock.h>
 #include <linux/sched.h>
 #include <linux/console.h>
+#include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/sched/task.h>
 #include <linux/smp.h>
@@ -114,7 +115,16 @@ static int __init add_kernel_resources(void)
 	bss_res.end = __pa_symbol(__bss_stop) - 1;
 	bss_res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 
-	kimage_res.start = code_res.start;
+	/*
+	 * An XIP kernel's code and rodata stay in flash, below or above RAM:
+	 * an image resource from there to the end of bss would straddle the
+	 * start or the end of System RAM, and inserting the RAM would fail.
+	 * Only the data and bss copied into RAM are the image there.
+	 */
+	if (IS_ENABLED(CONFIG_XIP_KERNEL))
+		kimage_res.start = data_res.start;
+	else
+		kimage_res.start = code_res.start;
 	kimage_res.end = bss_res.end;
 	kimage_res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 
@@ -122,13 +132,15 @@ static int __init add_kernel_resources(void)
 	if (ret < 0)
 		return ret;
 
-	ret = add_resource(&kimage_res, &code_res);
-	if (ret < 0)
-		return ret;
+	if (!IS_ENABLED(CONFIG_XIP_KERNEL)) {
+		ret = add_resource(&kimage_res, &code_res);
+		if (ret < 0)
+			return ret;
 
-	ret = add_resource(&kimage_res, &rodata_res);
-	if (ret < 0)
-		return ret;
+		ret = add_resource(&kimage_res, &rodata_res);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = add_resource(&kimage_res, &data_res);
 	if (ret < 0)
@@ -288,6 +300,11 @@ static void __init riscv_spinlock_init(void)
 		return;
 	}
 
+	if (IS_ENABLED(CONFIG_RISCV_AMO_SPINLOCKS)) {
+		pr_info("AMO test-and-set spinlock: enabled\n");
+		return;
+	}
+
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZABHA) &&
 	    IS_ENABLED(CONFIG_RISCV_ISA_ZACAS) &&
 	    IS_ENABLED(CONFIG_TOOLCHAIN_HAS_ZACAS) &&
@@ -363,6 +380,16 @@ void __init setup_arch(char **cmdline_p)
 
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
 	    riscv_isa_extension_available(NULL, ZICBOM))
+		riscv_noncoherent_supported();
+	/*
+	 * The ESP32-S31 has no Zicbom: its DMA cache maintenance goes through
+	 * the SBI, and drivers/cache/esp32s31_cache.c registers it only at
+	 * arch_initcall. Declare the non-coherent DMA here already, so that
+	 * dma_cache_alignment and the swiotlb bounce buffer for small
+	 * kmalloc() buffers are set up for it.
+	 */
+	if (IS_ENABLED(CONFIG_ESP32S31_CACHE) &&
+	    of_machine_is_compatible("esp,esp32s31"))
 		riscv_noncoherent_supported();
 	riscv_set_dma_cache_alignment();
 

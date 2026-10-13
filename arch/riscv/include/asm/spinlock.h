@@ -39,12 +39,20 @@ SPINLOCK_BASE_DECLARE(value_unlocked, int, arch_spinlock_t)
 
 #include <asm/qspinlock.h>
 
+#elif defined(CONFIG_RISCV_AMO_SPINLOCKS)
+
+#include <asm/amo_spinlock.h>
+
 #else
 
 #include <asm/ticket_spinlock.h>
 
 #endif
 
+#ifdef CONFIG_RISCV_AMO_SPINLOCKS
+#include <asm/amo_rwlock.h>
+#else
 #include <asm/qrwlock.h>
+#endif
 
 #endif /* __ASM_RISCV_SPINLOCK_H */

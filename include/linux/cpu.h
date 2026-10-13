@@ -169,11 +169,16 @@ static inline void suspend_enable_secondary_cpus(void) { }
 void __noreturn cpu_startup_entry(enum cpuhp_state state);
 
 void cpu_idle_poll_ctrl(bool enable);
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+/* ESP32-S31 radio only, a private workaround: keep CPU 0 polling in idle. */
+void esp32s31_radio_idle_poll_set(bool active);
+#endif
 
 bool cpu_in_idle(unsigned long pc);
 
 void arch_cpu_idle(void);
 void arch_cpu_idle_prepare(void);
+void arch_cpu_idle_poll(void);
 void arch_cpu_idle_enter(void);
 void arch_cpu_idle_exit(void);
 void arch_tick_broadcast_enter(void);

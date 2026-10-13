@@ -22,6 +22,7 @@
 #include <linux/delay.h>
 #include <linux/irq.h>
 #include <linux/irq_work.h>
+#include <linux/irqchip/irq-esp32s31.h>
 #include <linux/nmi.h>
 
 #include <asm/tlbflush.h>
@@ -343,6 +344,7 @@ EXPORT_SYMBOL_GPL(arch_smp_send_reschedule);
 static void riscv_backtrace_ipi(cpumask_t *mask)
 {
 	send_ipi_mask(mask, IPI_CPU_BACKTRACE);
+	esp32s31_report_harts(mask);
 }
 
 void arch_trigger_cpumask_backtrace(const cpumask_t *mask, int exclude_cpu)

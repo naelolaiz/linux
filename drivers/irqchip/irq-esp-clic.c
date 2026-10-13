@@ -21,8 +21,8 @@
  * child of this domain. Peripherals reference INTMTX in DT;
  * INTMTX.alloc forwards to clic.alloc with the chosen slot.
  *
- * Scope limit: usable slots are 16-31 (intc covers BITS_PER_LONG = 32
- * hwirqs on RV32). Sources 32-47 need a riscv-intc extension.
+ * ESP32-S31 extends the parent riscv-intc domain to cover external slots
+ * 16-47 even on RV32; their enables live in this MMIO layer, not sie/sieh.
  */
 
 #include <linux/io.h>
@@ -34,6 +34,9 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
+
+#include "irq-esp32s31-internal.h"
 
 /* Supervisor bank per-source byte layout (mirror of M-bank in OpenSBI):
  *   +0 clicintip   pending bit
@@ -50,12 +53,18 @@
 
 #define CLIC_ATTR_TRIG_MASK	0x6U
 #define CLIC_ATTR_TRIG_LEVEL	0x0U
+#define CLIC_ATTR_MODE_MASK	0xC0U
+#define CLIC_ATTR_MODE_S	0x40U
+#define CLIC_ATTR_SHV		0x1U
 
 #define CLIC_CTL_MAX_PRIO	0xE0U
 
-#define CLIC_EXT_FIRST		16U
-#define CLIC_EXT_LAST		31U
+#define CLIC_EXT_FIRST		ESP32S31_CLIC_EXT_FIRST
+#define CLIC_EXT_LAST		ESP32S31_CLIC_EXT_LAST
 #define CLIC_EXT_COUNT		(CLIC_EXT_LAST - CLIC_EXT_FIRST + 1U)
+
+/* The S-mode view is hart-relative; +64 KiB selects the other hart. */
+#define CLIC_OTHER_HART_OFF	0x10000U
 
 struct esp_clic {
 	void __iomem		*base;
@@ -71,14 +80,32 @@ static inline unsigned int slot_to_idx(unsigned int slot)
 	return slot - CLIC_EXT_FIRST;
 }
 
+/*
+ * Register @off of @cpu's S-mode bank. Called with preemption or interrupts
+ * off (irq_chip callbacks under the descriptor lock, CPU hotplug STARTING
+ * callbacks, the domain alloc), so the current CPU cannot change under us.
+ */
+static inline void __iomem *esp_clic_hart_reg(struct esp_clic *priv,
+					       unsigned int cpu,
+					       unsigned int off)
+{
+	void __iomem *base = priv->base;
+
+	if (cpu != smp_processor_id())
+		base += CLIC_OTHER_HART_OFF;
+	return base + off;
+}
+
 static void esp_clic_mask(struct irq_data *d)
 {
-	writeb_relaxed(0, clic->base + CLIC_INTIE_OFF(d->hwirq));
+	writeb_relaxed(0, esp_clic_hart_reg(clic, 0,
+						CLIC_INTIE_OFF(d->hwirq)));
 }
 
 static void esp_clic_unmask(struct irq_data *d)
 {
-	writeb_relaxed(1, clic->base + CLIC_INTIE_OFF(d->hwirq));
+	writeb_relaxed(1, esp_clic_hart_reg(clic, 0,
+						CLIC_INTIE_OFF(d->hwirq)));
 }
 
 static int esp_clic_set_type(struct irq_data *d, unsigned int type)
@@ -88,9 +115,13 @@ static int esp_clic_set_type(struct irq_data *d, unsigned int type)
 	if (type != IRQ_TYPE_LEVEL_HIGH)
 		return -EINVAL;
 
-	attr = readb_relaxed(clic->base + CLIC_INTATTR_OFF(d->hwirq));
-	attr = (attr & ~CLIC_ATTR_TRIG_MASK) | CLIC_ATTR_TRIG_LEVEL;
-	writeb_relaxed(attr, clic->base + CLIC_INTATTR_OFF(d->hwirq));
+	attr = readb_relaxed(esp_clic_hart_reg(clic, 0,
+						  CLIC_INTATTR_OFF(d->hwirq)));
+	/* S31's S-mode window does not reliably return the MODE bits. */
+	attr &= ~(CLIC_ATTR_MODE_MASK | CLIC_ATTR_TRIG_MASK | CLIC_ATTR_SHV);
+	attr |= CLIC_ATTR_MODE_S | CLIC_ATTR_TRIG_LEVEL;
+	writeb_relaxed(attr, esp_clic_hart_reg(clic, 0,
+						   CLIC_INTATTR_OFF(d->hwirq)));
 	irq_set_handler_locked(d, handle_level_irq);
 	return 0;
 }
@@ -138,6 +169,104 @@ static int esp_clic_install_chained(struct esp_clic *priv, unsigned int slot)
 	return 0;
 }
 
+/*
+ * Map per-hart @slot in the hart-local interrupt domain, where every
+ * interrupt is per-CPU: the caller can request_percpu_irq() the result.
+ */
+int esp_clic_map_local(unsigned int slot)
+{
+	unsigned int idx, intc_virq;
+
+	if (!clic || slot < CLIC_EXT_FIRST || slot > CLIC_EXT_LAST)
+		return -EINVAL;
+
+	idx = slot_to_idx(slot);
+	if (clic->intc_virqs[idx])
+		return -EBUSY;
+
+	intc_virq = irq_create_mapping(clic->parent_domain, slot);
+	if (!intc_virq)
+		return -ENXIO;
+
+	clic->intc_virqs[idx] = intc_virq;
+	return intc_virq;
+}
+
+int esp_clic_install_local(unsigned int slot,
+			   void (*handler)(struct irq_desc *), void *data)
+{
+	int intc_virq = esp_clic_map_local(slot);
+
+	if (intc_virq < 0)
+		return intc_virq;
+
+	irq_set_chained_handler_and_data(intc_virq, handler, data);
+	return 0;
+}
+
+#ifdef CONFIG_ESP32S31_SMP_LOCKUP_REPORT
+/* Pending and enable bytes of @slot in hart @cpu's bank, for lockup reports. */
+void esp_clic_local_state(unsigned int cpu, unsigned int slot, u8 *ip, u8 *ie)
+{
+	*ip = *ie = 0xff;
+	if (!clic || cpu >= nr_cpu_ids ||
+	    slot < CLIC_EXT_FIRST || slot > CLIC_EXT_LAST)
+		return;
+
+	guard(preempt)();
+	*ip = readb_relaxed(esp_clic_hart_reg(clic, cpu, CLIC_INTIP_OFF(slot)));
+	*ie = readb_relaxed(esp_clic_hart_reg(clic, cpu, CLIC_INTIE_OFF(slot)));
+}
+#endif
+
+/*
+ * Slots pending and enabled in this hart's bank, as bits 16-47: device
+ * slots on hart 0, which takes them all, and the per-hart slots on any
+ * hart. Called with interrupts off.
+ */
+u64 esp_clic_pending_local(void)
+{
+	unsigned int cpu = smp_processor_id();
+	unsigned int slot;
+	u64 pending = 0;
+
+	if (!clic)
+		return 0;
+
+	for (slot = CLIC_EXT_FIRST; slot <= CLIC_EXT_LAST; slot++) {
+		if (!clic->intc_virqs[slot_to_idx(slot)])
+			continue;
+		if (cpu && slot != ESP32S31_CLIC_IPI_SLOT &&
+		    slot != ESP32S31_CLIC_TIMER_SLOT)
+			continue;
+		if ((readb_relaxed(esp_clic_hart_reg(clic, cpu,
+						     CLIC_INTIP_OFF(slot))) & 1) &&
+		    (readb_relaxed(esp_clic_hart_reg(clic, cpu,
+						     CLIC_INTIE_OFF(slot))) & 1))
+			pending |= BIT_ULL(slot);
+	}
+	return pending;
+}
+
+void esp_clic_configure_local(unsigned int cpu, unsigned int slot, bool enable)
+{
+	if (WARN_ON_ONCE(!clic || cpu >= nr_cpu_ids ||
+			 slot < CLIC_EXT_FIRST || slot > CLIC_EXT_LAST))
+		return;
+
+	writeb_relaxed(0, esp_clic_hart_reg(clic, cpu, CLIC_INTIE_OFF(slot)));
+	writeb_relaxed(0, esp_clic_hart_reg(clic, cpu, CLIC_INTIP_OFF(slot)));
+	/* MODE is not reliably readable through S31's S-mode CLIC window. */
+	writeb_relaxed(CLIC_ATTR_MODE_S | CLIC_ATTR_TRIG_LEVEL,
+		       esp_clic_hart_reg(clic, cpu, CLIC_INTATTR_OFF(slot)));
+	writeb_relaxed(CLIC_CTL_MAX_PRIO,
+		       esp_clic_hart_reg(clic, cpu, CLIC_INTCTL_OFF(slot)));
+	if (enable)
+		writeb_relaxed(1, esp_clic_hart_reg(clic, cpu,
+							CLIC_INTIE_OFF(slot)));
+	readb_relaxed(esp_clic_hart_reg(clic, cpu, CLIC_INTIE_OFF(slot)));
+}
+
 static int esp_clic_domain_alloc(struct irq_domain *domain, unsigned int virq,
 				 unsigned int nr_irqs, void *arg)
 {
@@ -161,9 +290,13 @@ static int esp_clic_domain_alloc(struct irq_domain *domain, unsigned int virq,
 		 * gets a handler, so the first unmask doesn't take a spurious
 		 * interrupt.
 		 */
-		writeb_relaxed(0, priv->base + CLIC_INTIP_OFF(src));
-		writeb_relaxed(CLIC_CTL_MAX_PRIO,
-			       priv->base + CLIC_INTCTL_OFF(src));
+		scoped_guard(preempt) {
+			writeb_relaxed(0, esp_clic_hart_reg(priv, 0,
+							    CLIC_INTIP_OFF(src)));
+			writeb_relaxed(CLIC_CTL_MAX_PRIO,
+				       esp_clic_hart_reg(priv, 0,
+							 CLIC_INTCTL_OFF(src)));
+		}
 
 		irq_domain_set_info(domain, virq + i, src, &esp_clic_chip,
 				    priv, handle_level_irq, NULL, NULL);

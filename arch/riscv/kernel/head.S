@@ -104,7 +104,15 @@ relocate_enable_mmu:
 	or a0, a0, a1
 	sfence.vma
 	csrw CSR_SATP, a0
+#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
+	/*
+	 * The CLIC forces stvec.base[5:0] to 0: the page fault taken after
+	 * the satp write only lands on 1: if 1: is 64-byte aligned.
+	 */
+	.balign 64
+#else
 .align 2
+#endif
 1:
 	/* Set trap vector to spin forever to help debug */
 	la a0, .Lsecondary_park
@@ -151,13 +159,11 @@ secondary_start_sbi:
 	la a3, .Lsecondary_park
 	csrw CSR_TVEC, a3
 
-	/* a0 contains the hartid & a1 contains boot data */
+	/* a0 is the hartid, a1 the physical boot data address: no XIP fix-up */
 	li a2, SBI_HART_BOOT_TASK_PTR_OFFSET
-	XIP_FIXUP_OFFSET a2
 	add a2, a2, a1
 	REG_L tp, (a2)
 	li a3, SBI_HART_BOOT_STACK_PTR_OFFSET
-	XIP_FIXUP_OFFSET a3
 	add a3, a3, a1
 	REG_L sp, (a3)
 
@@ -174,7 +180,12 @@ secondary_start_sbi:
 	call smp_callin
 #endif /* CONFIG_SMP */
 
+#ifdef CONFIG_RISCV_ESP_CLIC_TRAP_QUIRK
+	/* stvec points here before the real vector is set; see 1: above. */
+	.balign 64
+#else
 .align 2
+#endif
 .Lsecondary_park:
 	/*
 	 * Park this hart if we:

@@ -27,8 +27,10 @@
 #include <asm/bug.h>
 #include <asm/cfi.h>
 #include <asm/csr.h>
+#include <asm/esp-clic.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
+#include <asm/smp.h>
 #include <asm/syscall.h>
 #include <asm/thread_info.h>
 #include <asm/vector.h>
@@ -170,9 +172,58 @@ DO_ERROR_INFO(do_trap_insn_misaligned,
 DO_ERROR_INFO(do_trap_insn_fault,
 	SIGSEGV, SEGV_ACCERR, "instruction access fault");
 
+#ifdef CONFIG_ESP32S31_RADIO_SMODE
+/*
+ * ESP-IDF's PM implementation has one otherwise harmless M-mode read of
+ * mhartid in do_switch().  The radio objects now execute as part of the
+ * S-mode kernel, where that CSR correctly traps.  Emulate the read from
+ * Linux's logical-CPU-to-hart map instead of carrying a board-specific
+ * binary patch.  Match only CSRRS rd,mhartid,x0 (the canonical
+ * `csrr rd, mhartid` encoding), and never expose it to userspace.
+ */
+static __always_inline bool esp32s31_emulate_mhartid(struct pt_regs *regs)
+{
+	unsigned int rd;
+	u16 lo, hi;
+	u32 insn;
+
+	if (user_mode(regs))
+		return false;
+
+	/*
+	 * With RVC, epc may be only 2-byte aligned and a 32-bit opcode may end
+	 * on the next page: read the low halfword, then the high one only for
+	 * a 32-bit opcode, and without faulting.
+	 */
+	lo = READ_ONCE(*(u16 *)regs->epc);
+	if ((lo & __INSN_LENGTH_MASK) != __INSN_LENGTH_32 ||
+	    get_kernel_nofault(hi, (u16 *)regs->epc + 1))
+		return false;
+
+	insn = lo | (u32)hi << 16;
+	if ((insn & 0xfffff07fU) != 0xf1402073U)
+		return false;
+
+	rd = (insn >> 7) & 0x1f;
+	if (rd)
+		((unsigned long *)regs)[rd] =
+			cpuid_to_hartid_map(raw_smp_processor_id());
+	regs->epc += sizeof(insn);
+	return true;
+}
+#else
+static __always_inline bool esp32s31_emulate_mhartid(struct pt_regs *regs)
+{
+	return false;
+}
+#endif
+
 asmlinkage __visible __trap_section void do_trap_insn_illegal(struct pt_regs *regs)
 {
 	bool handled;
+
+	if (esp32s31_emulate_mhartid(regs))
+		return;
 
 	if (user_mode(regs)) {
 		irqentry_enter_from_user_mode(regs);
@@ -387,6 +438,14 @@ static void noinstr handle_riscv_irq(struct pt_regs *regs)
 	old_regs = set_irq_regs(regs);
 	handle_arch_irq(regs);
 	set_irq_regs(old_regs);
+	/*
+	 * Taking the interrupt raised the CLIC level. Lower it before
+	 * irq_exit_rcu(), which runs softirqs with interrupts on: the sret
+	 * that would lower it comes only at the end, and may come after the
+	 * return to user mode has scheduled another task, and that one gone
+	 * idle, with every interrupt masked.
+	 */
+	esp_clic_drop_level();
 	irq_exit_rcu();
 }
 

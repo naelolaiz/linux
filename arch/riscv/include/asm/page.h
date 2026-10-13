@@ -163,9 +163,15 @@ phys_addr_t linear_mapping_va_to_pa(unsigned long x);
 #define kernel_mapping_va_to_pa(y) ((unsigned long)(y) - kernel_map.va_kernel_pa_offset)
 #endif
 
+/*
+ * On rv32 the kernel mapping starts at PAGE_OFFSET, so the XIP kernel's
+ * flash text also passes is_linear_mapping(): check the kernel mapping
+ * first there. Its data is in both, with the same offset.
+ */
 #define __va_to_pa_nodebug(x)	({						\
 	unsigned long _x = x;							\
-	is_linear_mapping(_x) ?							\
+	(is_linear_mapping(_x) &&						\
+	 !(IS_ENABLED(CONFIG_XIP_KERNEL) && is_kernel_mapping(_x))) ?		\
 		linear_mapping_va_to_pa(_x) : kernel_mapping_va_to_pa(_x);	\
 	})
 

@@ -103,4 +103,30 @@ config ARCH_ESPRESSIF
 	help
 	  This enables support for Espressif RISC-V SoCs.
 
+config SOC_ESP32S31
+	def_bool ARCH_ESPRESSIF && 32BIT
+
+config ESP32S31_RADIO_SMODE
+	bool "ESP32-S31 radio: built-in kernel support"
+	depends on SOC_ESP32S31 && MMU && XIP_KERNEL
+	depends on RISCV_NO_ASID
+	help
+	  Built-in support for esp32s31-radio.ko, which runs Espressif's
+	  closed Wi-Fi, Bluetooth and PHY libraries. Those libraries use
+	  absolute addresses. This option:
+
+	  - maps the modem and peripheral windows, the internal SRAM and
+	    the mask ROM at their physical addresses in init_mm, and copies
+	    the cache-register, SRAM and ROM entries into every process's
+	    page table, so these kernel-only mappings sit below TASK_SIZE
+	    in every process;
+	  - emulates kernel-mode reads of mhartid;
+	  - adds a hook to the generic idle loop that keeps hart 0 polling
+	    while the radio asks for it;
+	  - exports kernel helpers to the module;
+	  - turns on ESP32S31_RADIO_XIP, the fixed mapping of the radio's
+	    flash slot and its Wi-Fi IRAM alias.
+
+	  Say N unless you run esp32s31-radio.ko.
+
 endmenu # "SoC selection"

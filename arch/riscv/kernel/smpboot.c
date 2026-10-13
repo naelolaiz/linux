@@ -186,8 +186,15 @@ int __cpu_up(unsigned int cpu, struct task_struct *tidle)
 
 	ret = start_secondary_cpu(cpu, tidle);
 	if (!ret) {
+		/*
+		 * A cold ESP32-S31 hart 1 goes through the ROM and OpenSBI's
+		 * warm boot first: give it more than the usual second.
+		 */
+		unsigned int timeout_ms = IS_ENABLED(CONFIG_ARCH_ESPRESSIF) ?
+					  20000 : 1000;
+
 		wait_for_completion_timeout(&cpu_running,
-					    msecs_to_jiffies(1000));
+					    msecs_to_jiffies(timeout_ms));
 
 		if (!cpu_online(cpu)) {
 			pr_crit("CPU%u: failed to come online\n", cpu);

@@ -16,8 +16,10 @@
 #define pr_fmt(fmt) "esp32s31-cache: " fmt
 
 #include <linux/cacheflush.h>
+#include <linux/export.h>
 #include <linux/init.h>
 #include <linux/printk.h>
+#include <linux/spinlock.h>
 #include <asm/dma-noncoherent.h>
 #include <asm/sbi.h>
 
@@ -34,18 +36,38 @@
 static unsigned long esp32s31_cache_extid(void)
 {
 	static unsigned long extid;
+	unsigned long id = READ_ONCE(extid);
 
-	if (unlikely(!extid))
-		extid = SBI_EXT_VENDOR_START +
+	if (unlikely(!id)) {
+		id = SBI_EXT_VENDOR_START +
 			(sbi_get_mvendorid() &
 			 (SBI_EXT_VENDOR_END - SBI_EXT_VENDOR_START));
-	return extid;
+		WRITE_ONCE(extid, id);
+	}
+	return id;
 }
 
-static void esp32s31_cache_op(unsigned long func, phys_addr_t paddr, size_t size)
+/*
+ * OpenSBI runs each call in the ROM's Cache_* helpers, which drive the one
+ * cache controller of the chip and take no lock. With two harts, DMA syncs
+ * and the I-cache syncs of remote fence.i IPIs can run on both at once:
+ * one call at a time.
+ */
+static DEFINE_RAW_SPINLOCK(esp32s31_cache_lock);
+
+static struct sbiret esp32s31_cache_op(unsigned long func, phys_addr_t paddr,
+				       size_t size)
 {
-	sbi_ecall(esp32s31_cache_extid(), func, (unsigned long)paddr,
-		  (unsigned long)size, 0, 0, 0, 0);
+	unsigned long extid = esp32s31_cache_extid();
+	unsigned long flags;
+	struct sbiret ret;
+
+	raw_spin_lock_irqsave(&esp32s31_cache_lock, flags);
+	ret = sbi_ecall(extid, func, (unsigned long)paddr, (unsigned long)size,
+			0, 0, 0, 0);
+	raw_spin_unlock_irqrestore(&esp32s31_cache_lock, flags);
+
+	return ret;
 }
 
 /*
@@ -57,8 +79,9 @@ static void esp32s31_cache_op(unsigned long func, phys_addr_t paddr, size_t size
  */
 void esp32s31_flush_icache(void)
 {
-	sbi_ecall(esp32s31_cache_extid(), S31_SBI_ICACHE_SYNC, 0, 0, 0, 0, 0, 0);
+	esp32s31_cache_op(S31_SBI_ICACHE_SYNC, 0, 0);
 }
+EXPORT_SYMBOL_GPL(esp32s31_flush_icache);
 
 /*
  * Range variant: sync only the lines backing one exec page (flash-XIP or PSRAM,
@@ -101,8 +124,7 @@ static int __init esp32s31_cache_init(void)
 	 * call. A zero-size probe is a no-op and would hide an M-mode PMP/ROM
 	 * fault until the first real DMA sync.
 	 */
-	ret = sbi_ecall(esp32s31_cache_extid(), S31_SBI_CACHE_WBACK,
-			0x50000000UL, 64, 0, 0, 0, 0);
+	ret = esp32s31_cache_op(S31_SBI_CACHE_WBACK, 0x50000000UL, 64);
 	if (ret.error) {
 		pr_err("cache SBI ecall unavailable (err %ld); DMA will be incoherent\n",
 		       ret.error);

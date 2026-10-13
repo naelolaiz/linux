@@ -660,7 +660,7 @@ config STARFIVE_JH8100_INTC
 
 config ESP_CLIC
 	bool "Espressif ESP32-S31 CLIC S-mode irqchip"
-	depends on RISCV
+	depends on ARCH_ESPRESSIF
 	select IRQ_DOMAIN_HIERARCHY
 	select RISCV_ESP_CLIC_TRAP_QUIRK
 	help
@@ -668,7 +668,8 @@ config ESP_CLIC
 	  so Linux can take external peripheral interrupts. OpenSBI is
 	  responsible for delegating the CLIC external sources to S-mode
 	  at boot; this driver owns enable/mask/priority/trigger from
-	  there.
+	  there. It selects RISCV_ESP_CLIC_TRAP_QUIRK, which changes the
+	  trap, idle and SBI call paths of the whole kernel.
 
 	  If unsure, say N.
 
@@ -676,11 +677,35 @@ config ESP_INTMTX
 	bool "Espressif ESP32-S31 INTMTX peripheral router"
 	depends on ESP_CLIC
 	select IRQ_DOMAIN_HIERARCHY
+	select GENERIC_IRQ_EFFECTIVE_AFF_MASK if SMP
 	help
 	  Drive the ESP32-S31 INTMTX, which routes peripheral source
 	  lines to CLIC slots. Sits between peripheral drivers and
 	  irq-esp-clic in the irq-domain hierarchy and allocates CLIC
 	  slots on demand.
+
+	  If unsure, say N.
+
+config ESP32S31_SMP
+	bool "Espressif ESP32-S31 cross-core IPI and per-hart timer"
+	depends on SMP && ESP_INTMTX
+	default y
+	select GENERIC_IRQ_IPI_MUX
+	help
+	  Run Linux on both harts of the ESP32-S31: Linux's IPIs go through
+	  the chip's cross-core doorbells, and each hart gets its own
+	  systimer comparator interrupt. Both are routed through each hart's
+	  own CLIC bank and INTMTX table.
+
+config ESP32S31_SMP_LOCKUP_REPORT
+	bool "ESP32-S31 lockup report from the bus monitor"
+	depends on ESP32S31_SMP && DEBUG_KERNEL
+	help
+	  Debug aid for two-hart ESP32-S31 kernels. Turn on the chip's bus
+	  monitor at boot. On a backtrace request (hard lockup detector,
+	  RCU stall, SysRq-l), print the PC samples, SP, last exception PC,
+	  doorbell and CLIC IPI/timer state of each hart that does not
+	  answer the backtrace IPI within one second.
 
 	  If unsure, say N.
 
